@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import html
 import datetime
 import threading
 import logging
@@ -58,7 +59,6 @@ TICKER = "KRW-BTC"
 
 STATE_FILE = Path(__file__).resolve().parent / "bot_state.json"
 FNG_URL = "https://api.alternative.me/fng/?limit=1"
-DIVIDER = "━━━━━━━━━━━━━━━"
 
 if not ACCESS_KEY or not SECRET_KEY or not TELEGRAM_TOKEN or not str(CHAT_ID or "").strip():
     logger.error("🚨 .env 확인: 키/토큰/채팅ID 누락")
@@ -66,9 +66,34 @@ if not ACCESS_KEY or not SECRET_KEY or not TELEGRAM_TOKEN or not str(CHAT_ID or 
 
 
 # ── 포맷 헬퍼 ──────────────────────────────────────────────────────────────
+def esc(s):
+    """HTML 특수문자 이스케이프 (parse_mode=HTML 사용 시 필수)."""
+    if s is None:
+        return ""
+    return html.escape(str(s), quote=False)
+
+
+def b(text):
+    """HTML bold 래퍼."""
+    return f"<b>{esc(text)}</b>"
+
+
 def fmt_krw(v):
     if v is None:
         return "N/A"
+    return f"{v:,.0f}원"
+
+
+def fmt_krw_short(v):
+    """괄호용 축약 표기: 약 X.X만원 / 약 X.XX억원."""
+    if v is None:
+        return "N/A"
+    av = abs(v)
+    sign = "-" if v < 0 else ""
+    if av >= 100_000_000:
+        return f"{sign}약 {av/100_000_000:.2f}억원"
+    if av >= 10_000:
+        return f"{sign}약 {av/10_000:.1f}만원"
     return f"{v:,.0f}원"
 
 
@@ -81,12 +106,19 @@ def fmt_pct(v, signed=True):
     return f"{sign}{v:.2f}%"
 
 
+def fmt_pnl_icon(v):
+    if v is None or v == 0:
+        return "📈" if (v or 0) >= 0 else "📉"
+    return "📈" if v > 0 else "📉"
+
+
 def fmt_pnl(v):
+    """확정 손익 라벨 (굵게)."""
     if v is None:
         return "N/A"
-    emoji = "📈" if v >= 0 else "📉"
     sign = "+" if v >= 0 else ""
-    return f"{sign}{v:,.0f}원 {emoji}"
+    icon = "📈" if v >= 0 else "📉"
+    return f"<b>{sign}{v:,.0f}원</b> {icon}"
 
 
 def fetch_fear_greed():
@@ -141,7 +173,7 @@ class DataProvider:
 
     @staticmethod
     def get_market_snapshot():
-        """`/market` 명령어용 스냅샷. 실패 항목은 None으로 반환."""
+        """/market 용 스냅샷. 실패 항목은 None."""
         snap = {
             "price": None, "change_pct_24h": None, "volume_24h_krw": None,
             "rsi_15m": None, "atr_15m": None,
@@ -282,6 +314,8 @@ class Execution:
 
 # ── 텔레그램 ────────────────────────────────────────────────────────────────
 class TelegramManager:
+    PARSE_MODE = "HTML"
+
     def __init__(self, token, chat_id, strategy_instance):
         self.bot = telebot.TeleBot(token)
         self.chat_id = str(chat_id).strip()
@@ -292,32 +326,31 @@ class TelegramManager:
         def send_help(message):
             if str(message.chat.id) != self.chat_id: return
             help_text = (
-                "⚙️ QuantBot 명령어\n"
-                f"{DIVIDER}\n"
-                "📊 조회\n"
-                "  /status  — 금고(자산/비중/수익률)\n"
-                "  /balance — 잔고 상세\n"
-                "  /market  — 시장 스캐닝\n"
-                "  /history — 최근 거래 내역\n\n"
-                "🎛 통제\n"
-                "  /pause   — 신규 매수 일시정지\n"
-                "  /resume  — 신규 매수 재개\n"
-                "  /panic   — 긴급 전량매도 + 대기\n"
-                "  /sell_all — 전량매도만 실행\n"
-                "  /stop    — 봇 프로세스 종료\n\n"
+                f"⚙️ {b('QuantBot 명령어')}\n\n"
+                f"📊 {b('조회')}\n"
+                "▫️ /status — 금고(자산·비중·수익률)\n"
+                "▫️ /balance — 잔고 상세\n"
+                "▫️ /market — 시장 스캐닝\n"
+                "▫️ /history — 최근 거래 내역\n\n"
+                f"🎛 {b('통제')}\n"
+                "▫️ /pause — 신규 매수 일시정지\n"
+                "▫️ /resume — 신규 매수 재개\n"
+                "▫️ /panic — 긴급 전량매도 + 대기\n"
+                "▫️ /sell_all — 전량매도만 실행\n"
+                "▫️ /stop — 봇 프로세스 종료\n\n"
                 "❓ /all — 이 목록 다시 보기"
             )
-            self.bot.reply_to(message, help_text)
+            self._reply(message, help_text)
 
         # /status
         @self.bot.message_handler(commands=["status"])
         def send_status(message):
             if str(message.chat.id) != self.chat_id: return
             try:
-                self.bot.reply_to(message, self.strategy.build_status_text())
+                self._reply(message, self.strategy.build_status_text())
             except Exception as e:
                 logger.error(f"/status 핸들러 에러: {e}")
-                self.bot.reply_to(message, f"⚠️ 상태 조회 에러: {e}")
+                self._reply(message, f"⚠️ 상태 조회 에러: {esc(e)}")
 
         # /balance
         @self.bot.message_handler(commands=["balance"])
@@ -328,42 +361,42 @@ class TelegramManager:
                 btc = self.strategy.upbit.get_balance(TICKER)
                 price = self.strategy.current_price
                 if krw is None or btc is None:
-                    self.bot.reply_to(message, "⚠️ 잔고 조회 실패 (API 오류). 잠시 후 다시 시도하세요.")
+                    self._reply(message, "⚠️ 잔고 조회 실패 (API 오류). 잠시 후 다시 시도하세요.")
                     return
                 btc_value = btc * price if price else 0.0
                 total = krw + btc_value
                 cash_ratio = (krw / total * 100) if total > 0 else 0.0
                 msg = (
-                    f"💰 잔고 상세\n{DIVIDER}\n"
-                    f"▫️ KRW: {fmt_krw(krw)}\n"
-                    f"▫️ BTC: {btc:.8f} ({fmt_krw(btc_value)})\n"
-                    f"▫️ 총자산: {fmt_krw(total)}\n"
-                    f"▫️ 현금 비중: {fmt_pct(cash_ratio, signed=False)}"
+                    f"💰 {b('잔고 상세')}\n\n"
+                    f"▫️ KRW: <b>{fmt_krw(krw)}</b>\n"
+                    f"▫️ BTC: {btc:.8f} ({fmt_krw_short(btc_value)})\n"
+                    f"▫️ 총자산: <b>{fmt_krw(total)}</b>\n"
+                    f"▫️ 현금 비중: <b>{fmt_pct(cash_ratio, signed=False)}</b>"
                 )
-                self.bot.reply_to(message, msg)
+                self._reply(message, msg)
             except Exception as e:
                 logger.error(f"/balance 핸들러 에러: {e}")
-                self.bot.reply_to(message, f"⚠️ 잔고 조회 에러: {e}")
+                self._reply(message, f"⚠️ 잔고 조회 에러: {esc(e)}")
 
         # /market
         @self.bot.message_handler(commands=["market"])
         def send_market(message):
             if str(message.chat.id) != self.chat_id: return
             try:
-                self.bot.reply_to(message, self.strategy.build_market_text())
+                self._reply(message, self.strategy.build_market_text())
             except Exception as e:
                 logger.error(f"/market 핸들러 에러: {e}")
-                self.bot.reply_to(message, f"⚠️ 시장 조회 에러: {e}")
+                self._reply(message, f"⚠️ 시장 조회 에러: {esc(e)}")
 
         # /history
         @self.bot.message_handler(commands=["history"])
         def send_history(message):
             if str(message.chat.id) != self.chat_id: return
             try:
-                self.bot.reply_to(message, self.strategy.build_history_text())
+                self._reply(message, self.strategy.build_history_text())
             except Exception as e:
                 logger.error(f"/history 핸들러 에러: {e}")
-                self.bot.reply_to(message, f"⚠️ 내역 조회 에러: {e}")
+                self._reply(message, f"⚠️ 내역 조회 에러: {esc(e)}")
 
         # /pause
         @self.bot.message_handler(commands=["pause"])
@@ -371,8 +404,7 @@ class TelegramManager:
             if str(message.chat.id) != self.chat_id: return
             self.strategy.set_paused(True)
             self.send_msg(
-                "⏸️ 일시정지 활성화\n"
-                f"{DIVIDER}\n"
+                f"⏸️ {b('일시정지 활성화')}\n\n"
                 "▫️ 신규 매수 중단\n"
                 "▫️ 기존 포지션 청산 로직은 정상 동작\n"
                 "▫️ 재개: /resume"
@@ -384,38 +416,51 @@ class TelegramManager:
             if str(message.chat.id) != self.chat_id: return
             self.strategy.set_paused(False)
             self.send_msg(
-                "▶️ 일시정지 해제\n"
-                f"{DIVIDER}\n"
+                f"▶️ {b('일시정지 해제')}\n\n"
                 "▫️ 신규 매수 재개"
             )
 
-        # /panic — 전량매도 + 일시정지
+        # /panic
         @self.bot.message_handler(commands=["panic"])
         def panic_handler(message):
             if str(message.chat.id) != self.chat_id: return
-            self.send_msg("🚨 [PANIC] 긴급 전량매도 실행 중...")
+            self.send_msg(f"🚨 {b('[PANIC] 긴급 전량매도 실행 중...')}")
             self.strategy.emergency_liquidate(reason="Panic 매도", pause_after=True)
 
-        # /sell_all — 전량매도만
+        # /sell_all
         @self.bot.message_handler(commands=["sell_all"])
         def manual_sell_all(message):
             if str(message.chat.id) != self.chat_id: return
-            self.send_msg("🚨 [사용자 명령] 긴급 전량 매도를 실행합니다.")
+            self.send_msg(f"🚨 {b('[사용자 명령] 긴급 전량 매도를 실행합니다.')}")
             self.strategy.emergency_liquidate(reason="사용자 수동 전량매도", pause_after=False)
 
         # /stop
         @self.bot.message_handler(commands=["stop"])
         def stop_bot(message):
             if str(message.chat.id) != self.chat_id: return
-            self.send_msg("🛑 봇을 종료합니다. 재시작은 서버(PM2)에서 수행해야 합니다.")
+            self.send_msg(f"🛑 {b('봇을 종료합니다.')} 재시작은 서버(PM2)에서 수행해야 합니다.")
             os._exit(0)
+
+    def _reply(self, message, text):
+        try:
+            self.bot.reply_to(message, text, parse_mode=self.PARSE_MODE)
+        except Exception as e:
+            logger.error(f"텔레그램 reply 실패 (parse_mode={self.PARSE_MODE}): {e}")
+            try:
+                self.bot.reply_to(message, text)
+            except Exception as e2:
+                logger.error(f"텔레그램 reply 재시도 실패: {e2}")
 
     def send_msg(self, text):
         try:
-            self.bot.send_message(self.chat_id, text)
+            self.bot.send_message(self.chat_id, text, parse_mode=self.PARSE_MODE)
             logger.info(f"텔레그램: {text.replace(chr(10), ' | ')}")
         except Exception as e:
-            logger.error(f"텔레그램 전송 실패: {e}")
+            logger.error(f"텔레그램 전송 실패 (parse_mode={self.PARSE_MODE}): {e}")
+            try:
+                self.bot.send_message(self.chat_id, text)
+            except Exception as e2:
+                logger.error(f"텔레그램 전송 재시도 실패: {e2}")
 
     def start_listening(self):
         threading.Thread(target=self.bot.infinity_polling, daemon=True).start()
@@ -440,10 +485,8 @@ class QuantStrategy:
         self.last_mem_check = datetime.datetime.now() - datetime.timedelta(seconds=60)
         self.wm = None
 
-        # 최근 진입 근거 (알림용)
         self.last_entry_reason = ""
 
-        # 상태/통계
         self.state_lock = threading.Lock()
         self.is_paused_flag = False
         self.trade_history = deque(maxlen=10)
@@ -563,7 +606,7 @@ class QuantStrategy:
 
             if (now - self.last_ws_update).total_seconds() > 30:
                 logger.warning("웹소켓 30초 응답 없음. 재연결")
-                self.noti.send_msg("⚙️ 웹소켓 응답 없음 → 재연결 시도")
+                self.noti.send_msg(f"⚙️ {b('웹소켓 응답 없음 → 재연결 시도')}")
                 self.init_websocket()
                 fallback = pyupbit.get_current_price(TICKER)
                 if fallback:
@@ -583,11 +626,10 @@ class QuantStrategy:
             if mem.percent >= 80 and (now - self.last_mem_warn).total_seconds() >= 3600:
                 self.last_mem_warn = now
                 self.noti.send_msg(
-                    "🚨 메모리 위험 수준\n"
-                    f"{DIVIDER}\n"
-                    f"▫️ 사용률: {mem.percent:.1f}%\n"
+                    f"🚨 {b('[메모리 위험 수준]')}\n\n"
+                    f"▫️ 사용률: <b>{mem.percent:.1f}%</b>\n"
                     f"▫️ 사용량: {mem.used/1024/1024:.0f}MB / {mem.total/1024/1024:.0f}MB\n"
-                    "▫️ PM2 재시작 또는 프로세스 상태 확인 권장"
+                    f"▫️ PM2 재시작 또는 프로세스 상태 확인 권장"
                 )
                 logger.warning(f"메모리 경고: {mem.percent:.1f}%")
         except Exception as e:
@@ -626,30 +668,30 @@ class QuantStrategy:
         with self.pos.lock:
             state = self.pos.state
             ep = self.pos.entry_price
-        position_line = "▫️ 포지션: 없음"
+        position_lines = ["▫️ 포지션: 없음"]
         if state == "POSITION" and ep > 0 and price > 0:
             unreal = (price - ep) * btc
             unreal_pct = (price / ep - 1) * 100
-            position_line = (
-                f"▫️ 포지션: 보유 (평단 {fmt_krw(ep)})\n"
-                f"▫️ 평가손익: {fmt_pnl(unreal)} ({fmt_pct(unreal_pct)})"
-            )
+            position_lines = [
+                f"▫️ 포지션: 보유 (평단 <b>{fmt_krw(ep)}</b>)",
+                f"▫️ 평가손익: {fmt_pnl(unreal)} ({fmt_pct(unreal_pct)})",
+            ]
         elif state == "SETUP":
-            position_line = "▫️ 포지션: SETUP (매수 대기)"
+            position_lines = ["▫️ 포지션: SETUP (매수 대기)"]
 
         fng = fetch_fear_greed()
 
         msg = (
-            "📅 일일 리포트\n"
-            f"{DIVIDER}\n"
-            f"▫️ 총자산: {fmt_krw(total)}\n"
+            f"📅 {b('일일 리포트')}\n\n"
+            f"▫️ 총자산: <b>{fmt_krw(total)}</b>\n"
             f"{delta_line}\n"
             f"▫️ 누적 실현손익: {fmt_pnl(self.cumulative_pnl)}\n\n"
-            "📊 포지션 현황\n"
-            f"{position_line}\n\n"
-            "🌍 시장 지표\n"
-            f"▫️ BTC/KRW: {fmt_krw(price)}\n"
-            f"▫️ 공포/탐욕: {fng}"
+            f"📊 {b('포지션 현황')}\n"
+            + "\n".join(position_lines)
+            + "\n\n"
+            f"🌍 {b('시장 지표')}\n"
+            f"▫️ BTC/KRW: <b>{fmt_krw(price)}</b>\n"
+            f"▫️ 공포/탐욕: <b>{esc(fng)}</b>"
         )
         self.noti.send_msg(msg)
         self.previous_day_total = total
@@ -671,28 +713,29 @@ class QuantStrategy:
             tp1 = self.pos.tp1_done
 
         paused = self.is_paused()
+        state_label = f"<b>{esc(state)}</b>" + (" ⏸️" if paused else "")
 
         lines = [
-            "📊 QuantBot 상태",
-            DIVIDER,
-            f"▫️ 상태: {state}" + (" ⏸️" if paused else ""),
-            f"▫️ 현재가: {fmt_krw(price)}",
+            f"📊 {b('QuantBot 상태')}",
             "",
-            "💰 자산",
-            f"▫️ 총자산: {fmt_krw(total)}",
-            f"▫️ BTC: {btc:.8f} ({fmt_krw(btc_value)}, {fmt_pct(btc_ratio, signed=False)})",
-            f"▫️ KRW: {fmt_krw(krw)} ({fmt_pct(cash_ratio, signed=False)})",
+            f"▫️ 상태: {state_label}",
+            f"▫️ 현재가: <b>{fmt_krw(price)}</b>",
+            "",
+            f"💰 {b('자산')}",
+            f"▫️ 총자산: <b>{fmt_krw(total)}</b>",
+            f"▫️ BTC: {btc:.8f} ({fmt_krw_short(btc_value)}, {fmt_pct(btc_ratio, signed=False)})",
+            f"▫️ KRW: <b>{fmt_krw(krw)}</b> ({fmt_pct(cash_ratio, signed=False)})",
         ]
         if state == "SETUP":
-            lines += ["", "📈 포지션", f"▫️ 돌파 기준가: {fmt_krw(bp)}"]
+            lines += ["", f"📈 {b('포지션')}", f"▫️ 돌파 기준가: <b>{fmt_krw(bp)}</b>"]
         elif state == "POSITION" and ep > 0 and price > 0:
             pnl_pct = (price / ep - 1) * 100
             unreal = (price - ep) * btc
             lines += [
                 "",
-                "📈 포지션",
-                f"▫️ 평단가: {fmt_krw(ep)}",
-                f"▫️ 수익률: {fmt_pct(pnl_pct)}",
+                f"📈 {b('포지션')}",
+                f"▫️ 평단가: <b>{fmt_krw(ep)}</b>",
+                f"▫️ 수익률: <b>{fmt_pct(pnl_pct)}</b>",
                 f"▫️ 평가손익: {fmt_pnl(unreal)}",
                 f"▫️ 1차 익절: {'완료' if tp1 else '대기'}",
             ]
@@ -712,35 +755,39 @@ class QuantStrategy:
         fng = snap.get("fng")
 
         if ema20 is not None and ema50 is not None:
-            ema_line = f"▫️ EMA20 {'>' if ema20 > ema50 else '<'} EMA50 " \
-                       f"({'정배열' if ema20 > ema50 else '역배열'})"
+            arrangement = "정배열" if ema20 > ema50 else "역배열"
+            ema_line = (
+                f"▫️ EMA20/50: <b>{arrangement}</b> "
+                f"({fmt_krw_short(ema20)} / {fmt_krw_short(ema50)})"
+            )
         else:
             ema_line = "▫️ EMA: N/A"
 
         if adx is not None:
             trend_label = "강함" if adx >= 28 else ("보통" if adx >= 20 else "약함")
-            adx_line = f"▫️ ADX(14): {adx:.1f} (추세 {trend_label})"
+            adx_line = f"▫️ ADX(14): <b>{adx:.1f}</b> (추세 {trend_label})"
         else:
             adx_line = "▫️ ADX(14): N/A"
 
-        vol_line = f"▫️ 24h 거래대금: {fmt_krw(vol)}" if vol else "▫️ 24h 거래대금: N/A"
-        chg_line = f"▫️ 24h 변동: {fmt_pct(chg)}" if chg is not None else "▫️ 24h 변동: N/A"
-        rsi_line = f"▫️ RSI(14): {rsi:.1f}" if rsi is not None else "▫️ RSI(14): N/A"
-        atr_line = f"▫️ ATR(14): {fmt_krw(atr)}" if atr is not None else "▫️ ATR(14): N/A"
+        vol_line = (
+            f"▫️ 24h 거래대금: {fmt_krw_short(vol)}" if vol else "▫️ 24h 거래대금: N/A"
+        )
+        chg_line = f"▫️ 24h 변동: <b>{fmt_pct(chg)}</b>" if chg is not None else "▫️ 24h 변동: N/A"
+        rsi_line = f"▫️ RSI(14): <b>{rsi:.1f}</b>" if rsi is not None else "▫️ RSI(14): N/A"
+        atr_line = f"▫️ ATR(14): <b>{fmt_krw(atr)}</b>" if atr is not None else "▫️ ATR(14): N/A"
 
         return (
-            "🌍 시장 스캐닝\n"
-            f"{DIVIDER}\n"
-            f"▫️ BTC/KRW: {fmt_krw(price)}\n"
+            f"🌍 {b('시장 스캐닝')}\n\n"
+            f"▫️ BTC/KRW: <b>{fmt_krw(price)}</b>\n"
             f"{chg_line}\n"
             f"{vol_line}\n\n"
-            "📊 지표 (15분봉)\n"
+            f"📊 {b('지표 (15분봉)')}\n"
             f"{rsi_line}\n"
             f"{atr_line}\n\n"
-            "📈 추세 (1시간봉)\n"
+            f"📈 {b('추세 (1시간봉)')}\n"
             f"{ema_line}\n"
             f"{adx_line}\n\n"
-            f"😨 공포/탐욕: {fng}"
+            f"😨 공포/탐욕: <b>{esc(fng)}</b>"
         )
 
     def build_history_text(self):
@@ -748,16 +795,17 @@ class QuantStrategy:
             items = list(self.trade_history)[-5:]
             cum = self.cumulative_pnl
         if not items:
-            return "📜 최근 거래 내역\n" + DIVIDER + "\n기록 없음"
+            return f"📜 {b('최근 거래 내역')}\n\n기록 없음"
 
-        lines = ["📜 최근 거래 내역", DIVIDER]
+        lines = [f"📜 {b('최근 거래 내역')}", ""]
         for i, t in enumerate(reversed(items), 1):
             side_emoji = "🔴" if t["side"] == "BUY" else "🔵"
-            pnl_line = f" / {fmt_pnl(t['pnl'])}" if t.get("pnl") is not None else ""
+            side_label = "매수" if t["side"] == "BUY" else "매도"
+            pnl_line = f"\n   ▫️ 확정 손익: {fmt_pnl(t['pnl'])}" if t.get("pnl") is not None else ""
             lines.append(
-                f"{i}. {t['time']} {side_emoji} {t['side']}\n"
-                f"   {fmt_krw(t['price'])} × {t['volume']:.8f}{pnl_line}\n"
-                f"   근거: {t['reason']}"
+                f"<b>{i}.</b> {esc(t['time'])} {side_emoji} <b>{side_label}</b>\n"
+                f"   ▫️ <b>{fmt_krw(t['price'])}</b> × {t['volume']:.8f} BTC{pnl_line}\n"
+                f"   ▫️ 근거: {esc(t['reason'])}"
             )
         lines.append("")
         lines.append(f"💹 누적 실현손익: {fmt_pnl(cum)}")
@@ -772,7 +820,7 @@ class QuantStrategy:
 
         ok, sold = self.executor.safe_market_sell(TICKER, 1.0)
         if not ok:
-            self.noti.send_msg("❌ 매도 실패. 업비트 잔고나 API 상태를 확인하세요.")
+            self.noti.send_msg(f"❌ {b('매도 실패.')} 업비트 잔고나 API 상태를 확인하세요.")
             return
 
         realized = None
@@ -786,64 +834,75 @@ class QuantStrategy:
 
         krw = self.upbit.get_balance("KRW") or 0.0
         btc = self.upbit.get_balance(TICKER) or 0.0
-        total = krw + (btc * price if price else 0.0)
+        btc_value = btc * price if price else 0.0
+        total = krw + btc_value
+        cash_ratio = (krw / total * 100) if total > 0 else 0.0
 
-        msg = (
-            f"🔵 [긴급 전량매도 완료]\n{DIVIDER}\n"
-            f"▫️ 매도가: {fmt_krw(price)}\n"
-            f"▫️ 체결량: {sold:.8f} BTC\n"
-        )
+        lines = [
+            f"🔵 {b('[긴급 전량매도 완료]')}",
+            "",
+            f"▫️ 매도가: <b>{fmt_krw(price)}</b>",
+            f"▫️ 체결량: {sold:.8f} BTC ({fmt_krw_short(price*sold if price else 0)})",
+            f"▫️ 근거: {esc(reason)}",
+        ]
         if realized is not None:
-            msg += f"▫️ 확정 손익: {fmt_pnl(realized)}\n"
-        msg += (
-            f"\n💰 현재 잔고: {fmt_krw(krw)} (총자산 {fmt_krw(total)})\n"
-            f"💹 누적 실현손익: {fmt_pnl(self.cumulative_pnl)}"
-        )
+            lines.append(f"▫️ 확정 손익: {fmt_pnl(realized)}")
+        lines += [
+            "",
+            f"💰 현재 잔고: 현금 <b>{fmt_krw(krw)}</b> (잔여 비중 {fmt_pct(cash_ratio, signed=False)})",
+            f"💹 누적 실현손익: {fmt_pnl(self.cumulative_pnl)}",
+        ]
         if pause_after:
-            msg += "\n\n⏸️ 일시정지 ON — /resume 으로 재개"
-        self.noti.send_msg(msg)
+            lines += ["", "⏸️ 일시정지 ON — /resume 으로 재개"]
+        self.noti.send_msg("\n".join(lines))
 
     # ── 알림 빌더 (매수/매도) ─────────────────────────────────────────
-    def _send_buy_notice(self, fill_price, atr, reason):
+    def _send_buy_notice(self, fill_price, volume, atr, reason):
         krw = self.upbit.get_balance("KRW") or 0.0
         btc = self.upbit.get_balance(TICKER) or 0.0
         btc_value = btc * fill_price if fill_price else 0.0
         total = krw + btc_value
         cash_ratio = (krw / total * 100) if total > 0 else 0.0
+        order_value = fill_price * volume if (fill_price and volume) else 0.0
 
         self.noti.send_msg(
-            f"🔴 [신규 매수 체결] BTC/KRW\n{DIVIDER}\n"
-            f"▫️ 매수가: {fmt_krw(fill_price)}\n"
-            f"▫️ 체결량: {btc:.8f} BTC ({fmt_krw(btc_value)})\n"
-            f"▫️ ATR(15m): {fmt_krw(atr)}\n"
-            f"▫️ 매수 근거: {reason}\n\n"
-            f"💰 현재 잔고: {fmt_krw(krw)} (잔여 비중 {fmt_pct(cash_ratio, signed=False)})"
+            f"🔴 {b('[신규 매수 체결] BTC/KRW')}\n\n"
+            f"▫️ 매수가: <b>{fmt_krw(fill_price)}</b>\n"
+            f"▫️ 체결량: {volume:.8f} BTC ({fmt_krw_short(order_value)})\n"
+            f"▫️ 매수 근거: {esc(reason)}\n"
+            f"▫️ ATR(15m): {fmt_krw(atr)}\n\n"
+            f"💰 현재 잔고: 현금 <b>{fmt_krw(krw)}</b> (잔여 비중 {fmt_pct(cash_ratio, signed=False)})"
         )
 
     def _send_sell_notice(self, header, fill_price, sold_volume, reason, realized):
         krw = self.upbit.get_balance("KRW") or 0.0
         btc = self.upbit.get_balance(TICKER) or 0.0
-        total = krw + (btc * fill_price if fill_price else 0.0)
+        btc_value = btc * fill_price if fill_price else 0.0
+        total = krw + btc_value
+        order_value = fill_price * sold_volume if (fill_price and sold_volume) else 0.0
 
-        msg = (
-            f"{header}\n{DIVIDER}\n"
-            f"▫️ 매도가: {fmt_krw(fill_price)}\n"
-            f"▫️ 체결량: {sold_volume:.8f} BTC\n"
-            f"▫️ 매도 근거: {reason}\n"
-        )
+        lines = [
+            f"{header}",
+            "",
+            f"▫️ 매도가: <b>{fmt_krw(fill_price)}</b>",
+            f"▫️ 체결량: {sold_volume:.8f} BTC ({fmt_krw_short(order_value)})",
+            f"▫️ 매도 근거: {esc(reason)}",
+        ]
         if realized is not None:
-            msg += f"▫️ 확정 손익: {fmt_pnl(realized)}\n"
-        msg += (
-            f"\n💰 현재 잔고: {fmt_krw(krw)} (총자산 {fmt_krw(total)})\n"
-            f"💹 누적 실현손익: {fmt_pnl(self.cumulative_pnl)}"
-        )
-        self.noti.send_msg(msg)
+            label = "확정 수익" if realized >= 0 else "확정 손실"
+            lines.append(f"▫️ {label}: {fmt_pnl(realized)}")
+        lines += [
+            "",
+            f"💰 총자산: <b>{fmt_krw(total)}</b> (현금 {fmt_krw_short(krw)})",
+            f"💹 누적 실현손익: {fmt_pnl(self.cumulative_pnl)}",
+        ]
+        self.noti.send_msg("\n".join(lines))
 
     # ── 메인 루프 ──────────────────────────────────────────────────────
     def run(self):
         self.noti.start_listening()
         self.noti.send_msg(
-            f"⚙️ QuantBot V4.0 기동\n{DIVIDER}\n"
+            f"⚙️ {b('QuantBot V4.0 기동')}\n\n"
             "▫️ 명령어 안내: /all"
         )
         logger.info("메인 루프 시작")
@@ -865,10 +924,9 @@ class QuantStrategy:
                         self.pos.reset()
                         logger.warning("서킷 브레이커 발동: 6시간 진입 차단")
                         self.noti.send_msg(
-                            "🚨 서킷 브레이커 발동\n"
-                            f"{DIVIDER}\n"
+                            f"🚨 {b('[서킷 브레이커 발동]')}\n\n"
                             "▫️ 5분봉 -5% 이상 급락 감지\n"
-                            "▫️ 6시간 신규 진입 차단"
+                            "▫️ <b>6시간 신규 진입 차단</b>"
                         )
 
                 is_locked = (now < self.cooldown_until) or (now < self.flash_crash_until)
@@ -889,12 +947,11 @@ class QuantStrategy:
                         current_state = self.pos.state
                         breakout_price = self.pos.breakout_price
 
-                    # 일시정지 중에는 신규 진입/SETUP 모두 차단 (SETUP 대기는 취소)
                     if paused and current_state in ("IDLE", "SETUP"):
                         if current_state == "SETUP":
                             self.pos.reset()
                             logger.info("SETUP 취소: 일시정지")
-                            self.noti.send_msg("⏸️ SETUP 취소 (일시정지)")
+                            self.noti.send_msg(f"⏸️ {b('SETUP 취소')} (일시정지)")
 
                     elif current_state == "IDLE" and not is_locked:
                         is_uptrend = (
@@ -909,10 +966,9 @@ class QuantStrategy:
                             )
                             logger.info(f"SETUP 진입 (기준가 {highest_target:,.0f})")
                             self.noti.send_msg(
-                                "🟡 SETUP 진입\n"
-                                f"{DIVIDER}\n"
-                                f"▫️ 돌파 기준가: {fmt_krw(highest_target)}\n"
-                                f"▫️ ADX(1h): {data_1h['adx']:.1f}\n"
+                                f"🟡 {b('[SETUP 진입]')}\n\n"
+                                f"▫️ 돌파 기준가: <b>{fmt_krw(highest_target)}</b>\n"
+                                f"▫️ ADX(1h): <b>{data_1h['adx']:.1f}</b>\n"
                                 "▫️ 돌파 안착 확인 대기 중"
                             )
 
@@ -920,7 +976,7 @@ class QuantStrategy:
                         if data_1h["adx"] < 28 or data_1h["ema20"] < data_1h["ema50"]:
                             self.pos.reset()
                             logger.info("SETUP 취소: 상위 추세 붕괴")
-                            self.noti.send_msg("🚫 SETUP 취소 (상위 추세 붕괴)")
+                            self.noti.send_msg(f"🚫 {b('SETUP 취소')} (상위 추세 붕괴)")
                             continue
 
                         if self.last_closed_candle_time != current_closed_candle_time:
@@ -929,7 +985,7 @@ class QuantStrategy:
                                 if (atr_15m / self.current_price) < 0.0015:
                                     self.pos.reset()
                                     logger.info("SETUP 취소: 변동성 부족")
-                                    self.noti.send_msg("🚫 SETUP 취소 (변동성 0.15% 미만)")
+                                    self.noti.send_msg(f"🚫 {b('SETUP 취소')} (변동성 0.15% 미만)")
                                     continue
 
                                 krw_bal = self.upbit.get_balance("KRW")
@@ -949,15 +1005,21 @@ class QuantStrategy:
                                             self.record_trade(
                                                 "BUY", avg_buy, actual_btc_bal, reason, pnl=None
                                             )
-                                            self._send_buy_notice(avg_buy, atr_15m, reason)
+                                            self._send_buy_notice(
+                                                avg_buy, actual_btc_bal, atr_15m, reason
+                                            )
                                         else:
                                             self.pos.reset()
                                             logger.warning("잔고 검증 실패로 포지션 롤백")
-                                            self.noti.send_msg("⚠️ 매수 후 잔고 검증 실패. SETUP 해제")
+                                            self.noti.send_msg(
+                                                f"⚠️ {b('매수 후 잔고 검증 실패')}. SETUP 해제"
+                                            )
                                     else:
                                         self.pos.reset()
                                         logger.warning("매수 주문 실패")
-                                        self.noti.send_msg("⚠️ 매수 주문 실패. SETUP 해제")
+                                        self.noti.send_msg(
+                                            f"⚠️ {b('매수 주문 실패')}. SETUP 해제"
+                                        )
                                 else:
                                     self.pos.reset()
                                     logger.info("SETUP 취소: 예산 5000원 미만")
@@ -965,7 +1027,6 @@ class QuantStrategy:
                                 self.pos.reset()
                                 logger.info("SETUP 취소: 돌파 안착 실패")
 
-                # 포지션 청산 (일시정지와 무관하게 항상 동작)
                 with self.pos.lock:
                     in_position = self.pos.state == "POSITION" and self.pos.entry_price > 0
                     ep = self.pos.entry_price
@@ -984,17 +1045,16 @@ class QuantStrategy:
                             realized = (self.current_price - ep) * sold if sold > 0 else 0.0
                             if tp1_done:
                                 reason = "약익절 컷 (+0.5 ATR 트레일)"
-                                header = "🛡️ [약익절 컷 완료]"
+                                header = f"🛡️ {b('[약익절 컷] +0.5 ATR 트레일')}"
                             else:
                                 reason = "손절 (-1.5 ATR)"
-                                header = "📉 [손절 체결]"
+                                header = f"📉 {b('[손절 체결] -1.5 ATR')}"
                                 self.cooldown_until = now + datetime.timedelta(hours=3)
                             self.record_trade("SELL", self.current_price, sold, reason, pnl=realized)
                             self._send_sell_notice(header, self.current_price, sold, reason, realized)
                             if not tp1_done:
                                 self.noti.send_msg(
-                                    "⏳ 3시간 쿨다운 시작\n"
-                                    f"{DIVIDER}\n"
+                                    f"⏳ {b('3시간 쿨다운 시작')}\n\n"
                                     "▫️ 손절 이후 뇌동매매 방지"
                                 )
                             self.pos.reset()
@@ -1008,7 +1068,7 @@ class QuantStrategy:
                                 self.pos.tp1_done = True
                             self.record_trade("SELL", self.current_price, sold, reason, pnl=realized)
                             self._send_sell_notice(
-                                "🔵 [1차 익절 체결 +2.0 ATR]",
+                                f"🔵 {b('[1차 익절 체결] +2.0 ATR (30%)')}",
                                 self.current_price, sold, reason, realized,
                             )
 
@@ -1019,7 +1079,7 @@ class QuantStrategy:
                             reason = "2차 최종 익절 +8.0 ATR (전량)"
                             self.record_trade("SELL", self.current_price, sold, reason, pnl=realized)
                             self._send_sell_notice(
-                                "🔥 [최종 익절 체결 +8.0 ATR]",
+                                f"🔥 {b('[최종 익절 체결] +8.0 ATR (전량)')}",
                                 self.current_price, sold, reason, realized,
                             )
                             self.pos.reset()
@@ -1028,7 +1088,7 @@ class QuantStrategy:
                 now = datetime.datetime.now()
                 if (now - self.last_error_time).total_seconds() > 60:
                     logger.error(f"메인 루프 에러: {e}", exc_info=True)
-                    self.noti.send_msg(f"🚨 봇 에러: {e}")
+                    self.noti.send_msg(f"🚨 {b('봇 에러')}: {esc(e)}")
                     self.last_error_time = now
             time.sleep(0.5)
 
