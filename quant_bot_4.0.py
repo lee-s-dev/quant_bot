@@ -1,10 +1,12 @@
 import os
 import sys
 import time
+import json
 import datetime
 import threading
 import logging
 import queue
+from collections import deque
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -12,6 +14,7 @@ import requests
 import pyupbit
 import ta
 import telebot
+import psutil
 from dotenv import load_dotenv
 
 # ── HTTP 전역 타임아웃 패치 (ConnectTimeout=None 방지) ──────────────────────
@@ -53,11 +56,52 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TICKER = "KRW-BTC"
 
+STATE_FILE = Path(__file__).resolve().parent / "bot_state.json"
+FNG_URL = "https://api.alternative.me/fng/?limit=1"
+DIVIDER = "━━━━━━━━━━━━━━━"
+
 if not ACCESS_KEY or not SECRET_KEY or not TELEGRAM_TOKEN or not str(CHAT_ID or "").strip():
     logger.error("🚨 .env 확인: 키/토큰/채팅ID 누락")
     sys.exit(1)
 
 
+# ── 포맷 헬퍼 ──────────────────────────────────────────────────────────────
+def fmt_krw(v):
+    if v is None:
+        return "N/A"
+    return f"{v:,.0f}원"
+
+
+def fmt_pct(v, signed=True):
+    if v is None:
+        return "N/A"
+    sign = ("+" if v >= 0 else "")
+    if not signed:
+        sign = ""
+    return f"{sign}{v:.2f}%"
+
+
+def fmt_pnl(v):
+    if v is None:
+        return "N/A"
+    emoji = "📈" if v >= 0 else "📉"
+    sign = "+" if v >= 0 else ""
+    return f"{sign}{v:,.0f}원 {emoji}"
+
+
+def fetch_fear_greed():
+    try:
+        r = requests.get(FNG_URL, timeout=5)
+        data = r.json()
+        val = data["data"][0]["value"]
+        cls = data["data"][0]["value_classification"]
+        return f"{val} ({cls})"
+    except Exception as e:
+        logger.warning(f"공포/탐욕 지수 조회 실패: {e}")
+        return "N/A"
+
+
+# ── 데이터 / 도메인 클래스 ─────────────────────────────────────────────────
 class DataProvider:
     @staticmethod
     def get_market_data():
@@ -94,6 +138,55 @@ class DataProvider:
         except Exception as e:
             logger.warning(f"서킷브레이커 감시 에러: {e}")
             return False
+
+    @staticmethod
+    def get_market_snapshot():
+        """`/market` 명령어용 스냅샷. 실패 항목은 None으로 반환."""
+        snap = {
+            "price": None, "change_pct_24h": None, "volume_24h_krw": None,
+            "rsi_15m": None, "atr_15m": None,
+            "ema20_1h": None, "ema50_1h": None, "adx_1h": None,
+            "fng": None,
+        }
+        try:
+            df_day = pyupbit.get_ohlcv(TICKER, interval="day", count=2)
+            if df_day is not None and len(df_day) >= 2:
+                prev_close = df_day["close"].iloc[-2]
+                now_close = df_day["close"].iloc[-1]
+                snap["price"] = float(now_close)
+                snap["change_pct_24h"] = (now_close / prev_close - 1) * 100
+                snap["volume_24h_krw"] = float(df_day["value"].iloc[-1])
+        except Exception as e:
+            logger.warning(f"일봉 스냅샷 실패: {e}")
+
+        try:
+            df_15m = pyupbit.get_ohlcv(TICKER, interval="minute15", count=50)
+            if df_15m is not None:
+                rsi = ta.momentum.RSIIndicator(df_15m["close"], window=14).rsi()
+                atr = ta.volatility.AverageTrueRange(
+                    df_15m["high"], df_15m["low"], df_15m["close"], window=14
+                ).average_true_range()
+                snap["rsi_15m"] = float(rsi.iloc[-1])
+                snap["atr_15m"] = float(atr.iloc[-1])
+        except Exception as e:
+            logger.warning(f"15분봉 스냅샷 실패: {e}")
+
+        try:
+            df_1h = pyupbit.get_ohlcv(TICKER, interval="minute60", count=100)
+            if df_1h is not None:
+                ema20 = ta.trend.EMAIndicator(df_1h["close"], window=20).ema_indicator()
+                ema50 = ta.trend.EMAIndicator(df_1h["close"], window=50).ema_indicator()
+                adx = ta.trend.ADXIndicator(
+                    df_1h["high"], df_1h["low"], df_1h["close"], window=14
+                ).adx()
+                snap["ema20_1h"] = float(ema20.iloc[-1])
+                snap["ema50_1h"] = float(ema50.iloc[-1])
+                snap["adx_1h"] = float(adx.iloc[-1])
+        except Exception as e:
+            logger.warning(f"1시간봉 스냅샷 실패: {e}")
+
+        snap["fng"] = fetch_fear_greed()
+        return snap
 
 
 class Position:
@@ -158,73 +251,75 @@ class Execution:
             return None
 
     def safe_market_sell(self, ticker, volume_ratio=1.0):
+        """매도 실행. 반환: (성공 여부, 체결 추정 수량)."""
         try:
             initial_volume = self.upbit.get_balance(ticker)
             if initial_volume is None:
                 logger.error("매도 잔고 조회 실패 (None 반환) — 매도 취소")
-                return False
+                return False, 0.0
             sell_volume = round(initial_volume * volume_ratio, 8)
             if sell_volume <= 0:
-                return False
+                return False, 0.0
 
             order = self.upbit.sell_market_order(ticker, sell_volume)
             if order is None or (isinstance(order, dict) and "error" in order):
                 logger.error(f"매도 API 거절: {order}")
-                return False
+                return False, 0.0
 
             for _ in range(5):
                 time.sleep(1)
                 current_volume = self.upbit.get_balance(ticker)
                 if volume_ratio >= 0.99 and current_volume < initial_volume * 0.1:
-                    return True
+                    return True, sell_volume
                 if volume_ratio == 0.3 and current_volume < initial_volume * 0.75:
-                    return True
+                    return True, sell_volume
             logger.warning("체결 확인 실패: 잔고 변동 부족")
-            return False
+            return False, 0.0
         except Exception as e:
             logger.error(f"매도 실행 에러: {e}")
-            return False
+            return False, 0.0
 
 
+# ── 텔레그램 ────────────────────────────────────────────────────────────────
 class TelegramManager:
     def __init__(self, token, chat_id, strategy_instance):
         self.bot = telebot.TeleBot(token)
         self.chat_id = str(chat_id).strip()
         self.strategy = strategy_instance
 
-        # 1. /all - 모든 명령어 안내
+        # /all, /help, /start
         @self.bot.message_handler(commands=["all", "help", "start"])
         def send_help(message):
             if str(message.chat.id) != self.chat_id: return
             help_text = (
-                "🤖 QuantBot 명령어 리스트\n\n"
-                "📊 /status : 현재 봇 상태 및 수익률 확인\n"
-                "💰 /balance : KRW 및 BTC 잔고 확인\n"
-                "🚨 /sell_all : 현재 보유 BTC 즉시 전량 매도 (포지션 리셋)\n"
-                "🛑 /stop : 봇 프로세스 안전하게 종료\n"
-                "❓ /all : 사용할 수 있는 모든 명령어 보기"
+                "⚙️ QuantBot 명령어\n"
+                f"{DIVIDER}\n"
+                "📊 조회\n"
+                "  /status  — 금고(자산/비중/수익률)\n"
+                "  /balance — 잔고 상세\n"
+                "  /market  — 시장 스캐닝\n"
+                "  /history — 최근 거래 내역\n\n"
+                "🎛 통제\n"
+                "  /pause   — 신규 매수 일시정지\n"
+                "  /resume  — 신규 매수 재개\n"
+                "  /panic   — 긴급 전량매도 + 대기\n"
+                "  /sell_all — 전량매도만 실행\n"
+                "  /stop    — 봇 프로세스 종료\n\n"
+                "❓ /all — 이 목록 다시 보기"
             )
             self.bot.reply_to(message, help_text)
 
-        # 2. /status - 상태 조회
+        # /status
         @self.bot.message_handler(commands=["status"])
         def send_status(message):
             if str(message.chat.id) != self.chat_id: return
-            with self.strategy.pos.lock:
-                state = self.strategy.pos.state
-                bp = self.strategy.pos.breakout_price
-                ep = self.strategy.pos.entry_price
-                tp1 = self.strategy.pos.tp1_done
+            try:
+                self.bot.reply_to(message, self.strategy.build_status_text())
+            except Exception as e:
+                logger.error(f"/status 핸들러 에러: {e}")
+                self.bot.reply_to(message, f"⚠️ 상태 조회 에러: {e}")
 
-            price = self.strategy.current_price
-            msg = f"📊 상태: {state}\n현재가: {price:,.0f}원\n"
-            if state == "SETUP":
-                msg += f"돌파 기준가: {bp:,.0f}원\n"
-            elif state == "POSITION" and ep > 0:
-                msg += f"평단가: {ep:,.0f}원\n1차 익절: {tp1}\n수익률: {(price / ep - 1) * 100:.2f}%\n"
-            self.bot.reply_to(message, msg)
-
-        # 3. /balance - 잔고 조회
+        # /balance
         @self.bot.message_handler(commands=["balance"])
         def send_balance(message):
             if str(message.chat.id) != self.chat_id: return
@@ -235,25 +330,80 @@ class TelegramManager:
                 if krw is None or btc is None:
                     self.bot.reply_to(message, "⚠️ 잔고 조회 실패 (API 오류). 잠시 후 다시 시도하세요.")
                     return
-                total_est = krw + (btc * price) if price else krw
-                msg = f"💰 KRW: {krw:,.0f}원\nBTC: {btc:.8f}\n총자산(추정): {total_est:,.0f}원"
+                btc_value = btc * price if price else 0.0
+                total = krw + btc_value
+                cash_ratio = (krw / total * 100) if total > 0 else 0.0
+                msg = (
+                    f"💰 잔고 상세\n{DIVIDER}\n"
+                    f"▫️ KRW: {fmt_krw(krw)}\n"
+                    f"▫️ BTC: {btc:.8f} ({fmt_krw(btc_value)})\n"
+                    f"▫️ 총자산: {fmt_krw(total)}\n"
+                    f"▫️ 현금 비중: {fmt_pct(cash_ratio, signed=False)}"
+                )
                 self.bot.reply_to(message, msg)
             except Exception as e:
                 logger.error(f"/balance 핸들러 에러: {e}")
                 self.bot.reply_to(message, f"⚠️ 잔고 조회 에러: {e}")
 
-        # 4. /sell_all - 긴급 전량 매도
+        # /market
+        @self.bot.message_handler(commands=["market"])
+        def send_market(message):
+            if str(message.chat.id) != self.chat_id: return
+            try:
+                self.bot.reply_to(message, self.strategy.build_market_text())
+            except Exception as e:
+                logger.error(f"/market 핸들러 에러: {e}")
+                self.bot.reply_to(message, f"⚠️ 시장 조회 에러: {e}")
+
+        # /history
+        @self.bot.message_handler(commands=["history"])
+        def send_history(message):
+            if str(message.chat.id) != self.chat_id: return
+            try:
+                self.bot.reply_to(message, self.strategy.build_history_text())
+            except Exception as e:
+                logger.error(f"/history 핸들러 에러: {e}")
+                self.bot.reply_to(message, f"⚠️ 내역 조회 에러: {e}")
+
+        # /pause
+        @self.bot.message_handler(commands=["pause"])
+        def pause_bot(message):
+            if str(message.chat.id) != self.chat_id: return
+            self.strategy.set_paused(True)
+            self.send_msg(
+                "⏸️ 일시정지 활성화\n"
+                f"{DIVIDER}\n"
+                "▫️ 신규 매수 중단\n"
+                "▫️ 기존 포지션 청산 로직은 정상 동작\n"
+                "▫️ 재개: /resume"
+            )
+
+        # /resume
+        @self.bot.message_handler(commands=["resume"])
+        def resume_bot(message):
+            if str(message.chat.id) != self.chat_id: return
+            self.strategy.set_paused(False)
+            self.send_msg(
+                "▶️ 일시정지 해제\n"
+                f"{DIVIDER}\n"
+                "▫️ 신규 매수 재개"
+            )
+
+        # /panic — 전량매도 + 일시정지
+        @self.bot.message_handler(commands=["panic"])
+        def panic_handler(message):
+            if str(message.chat.id) != self.chat_id: return
+            self.send_msg("🚨 [PANIC] 긴급 전량매도 실행 중...")
+            self.strategy.emergency_liquidate(reason="Panic 매도", pause_after=True)
+
+        # /sell_all — 전량매도만
         @self.bot.message_handler(commands=["sell_all"])
         def manual_sell_all(message):
             if str(message.chat.id) != self.chat_id: return
             self.send_msg("🚨 [사용자 명령] 긴급 전량 매도를 실행합니다.")
-            if self.strategy.executor.safe_market_sell(TICKER, 1.0):
-                self.strategy.pos.reset()
-                self.send_msg("✅ 전량 매도 및 포지션 리셋 완료.")
-            else:
-                self.send_msg("❌ 매도 실패. 업비트 잔고나 API 상태를 확인하세요.")
+            self.strategy.emergency_liquidate(reason="사용자 수동 전량매도", pause_after=False)
 
-        # 5. /stop - 봇 종료
+        # /stop
         @self.bot.message_handler(commands=["stop"])
         def stop_bot(message):
             if str(message.chat.id) != self.chat_id: return
@@ -263,7 +413,7 @@ class TelegramManager:
     def send_msg(self, text):
         try:
             self.bot.send_message(self.chat_id, text)
-            logger.info(f"텔레그램: {text.replace(chr(10), ' ')}")
+            logger.info(f"텔레그램: {text.replace(chr(10), ' | ')}")
         except Exception as e:
             logger.error(f"텔레그램 전송 실패: {e}")
 
@@ -271,6 +421,7 @@ class TelegramManager:
         threading.Thread(target=self.bot.infinity_polling, daemon=True).start()
 
 
+# ── 전략 / 메인 루프 ───────────────────────────────────────────────────────
 class QuantStrategy:
     def __init__(self):
         self.upbit = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY)
@@ -285,19 +436,86 @@ class QuantStrategy:
         self.last_data_fetch = datetime.datetime.now() - datetime.timedelta(minutes=1)
         self.last_closed_candle_time = None
         self.last_error_time = datetime.datetime.now() - datetime.timedelta(hours=1)
+        self.last_mem_warn = datetime.datetime.now() - datetime.timedelta(hours=1)
+        self.last_mem_check = datetime.datetime.now() - datetime.timedelta(seconds=60)
         self.wm = None
+
+        # 최근 진입 근거 (알림용)
+        self.last_entry_reason = ""
+
+        # 상태/통계
+        self.state_lock = threading.Lock()
+        self.is_paused_flag = False
+        self.trade_history = deque(maxlen=10)
+        self.cumulative_pnl = 0.0
+        self.previous_day_total = None
+        self.last_briefing_date = None
+        self._load_state()
 
         self.init_websocket()
         self.sync_account_on_startup()
 
+    # ── 영구 상태 ──────────────────────────────────────────────────────
+    def _load_state(self):
+        if not STATE_FILE.exists():
+            return
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.cumulative_pnl = float(data.get("cumulative_pnl", 0.0))
+            self.previous_day_total = data.get("previous_day_total")
+            self.last_briefing_date = data.get("last_briefing_date")
+            for t in data.get("trade_history", [])[-10:]:
+                self.trade_history.append(t)
+            logger.info(f"상태 파일 로드: 누적 PnL {self.cumulative_pnl:,.0f}원")
+        except Exception as e:
+            logger.warning(f"상태 파일 로드 실패: {e}")
+
+    def _save_state(self):
+        try:
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump({
+                    "cumulative_pnl": self.cumulative_pnl,
+                    "previous_day_total": self.previous_day_total,
+                    "last_briefing_date": self.last_briefing_date,
+                    "trade_history": list(self.trade_history),
+                }, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"상태 파일 저장 실패: {e}")
+
+    # ── 통제 플래그 ────────────────────────────────────────────────────
+    def set_paused(self, val: bool):
+        with self.state_lock:
+            self.is_paused_flag = bool(val)
+        logger.info(f"pause 플래그 설정: {val}")
+
+    def is_paused(self):
+        with self.state_lock:
+            return self.is_paused_flag
+
+    # ── 거래 기록 ──────────────────────────────────────────────────────
+    def record_trade(self, side, price, volume, reason, pnl=None):
+        entry = {
+            "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "side": side,
+            "price": float(price) if price else 0.0,
+            "volume": float(volume) if volume else 0.0,
+            "reason": reason,
+            "pnl": (float(pnl) if pnl is not None else None),
+        }
+        with self.state_lock:
+            self.trade_history.append(entry)
+            if pnl is not None:
+                self.cumulative_pnl += float(pnl)
+            self._save_state()
+
+    # ── 웹소켓 ─────────────────────────────────────────────────────────
     def init_websocket(self):
         try:
             if self.wm is not None:
                 self.wm.terminate()
                 time.sleep(1)
             self.wm = pyupbit.WebSocketManager("ticker", [TICKER])
-            # pyupbit는 get() 호출 시 프로세스를 시작하므로,
-            # 지연 시작으로 큐 병목이 생기지 않게 명시적으로 기동합니다.
             self.wm.alive = True
             self.wm.start()
             self.last_ws_update = datetime.datetime.now()
@@ -324,7 +542,6 @@ class QuantStrategy:
             if self.wm is not None:
                 q = getattr(self.wm, "_WebSocketManager__q", None)
                 if q is not None:
-                    # 큐를 한 번에 비워 최신 틱만 반영해 stale price를 방지합니다.
                     while True:
                         try:
                             data = q.get_nowait()
@@ -346,7 +563,7 @@ class QuantStrategy:
 
             if (now - self.last_ws_update).total_seconds() > 30:
                 logger.warning("웹소켓 30초 응답 없음. 재연결")
-                self.noti.send_msg("🔄 웹소켓 응답 없음. 재연결 시도")
+                self.noti.send_msg("⚙️ 웹소켓 응답 없음 → 재연결 시도")
                 self.init_websocket()
                 fallback = pyupbit.get_current_price(TICKER)
                 if fallback:
@@ -355,15 +572,289 @@ class QuantStrategy:
         except Exception as e:
             logger.warning(f"웹소켓 헬스체크 에러: {e}")
 
+    # ── 메모리 모니터링 ────────────────────────────────────────────────
+    def check_memory(self):
+        now = datetime.datetime.now()
+        if (now - self.last_mem_check).total_seconds() < 60:
+            return
+        self.last_mem_check = now
+        try:
+            mem = psutil.virtual_memory()
+            if mem.percent >= 80 and (now - self.last_mem_warn).total_seconds() >= 3600:
+                self.last_mem_warn = now
+                self.noti.send_msg(
+                    "🚨 메모리 위험 수준\n"
+                    f"{DIVIDER}\n"
+                    f"▫️ 사용률: {mem.percent:.1f}%\n"
+                    f"▫️ 사용량: {mem.used/1024/1024:.0f}MB / {mem.total/1024/1024:.0f}MB\n"
+                    "▫️ PM2 재시작 또는 프로세스 상태 확인 권장"
+                )
+                logger.warning(f"메모리 경고: {mem.percent:.1f}%")
+        except Exception as e:
+            logger.warning(f"메모리 체크 에러: {e}")
+
+    # ── 일일 브리핑 ────────────────────────────────────────────────────
+    def maybe_send_daily_briefing(self):
+        now = datetime.datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+        if now.hour != 9:
+            return
+        if self.last_briefing_date == today_str:
+            return
+        try:
+            self.send_daily_briefing()
+        except Exception as e:
+            logger.error(f"일일 브리핑 생성 에러: {e}")
+        finally:
+            self.last_briefing_date = today_str
+            self._save_state()
+
+    def send_daily_briefing(self):
+        krw = self.upbit.get_balance("KRW") or 0.0
+        btc = self.upbit.get_balance(TICKER) or 0.0
+        price = self.current_price or pyupbit.get_current_price(TICKER) or 0.0
+        btc_value = btc * price
+        total = krw + btc_value
+
+        if self.previous_day_total and self.previous_day_total > 0:
+            delta_pct = (total / self.previous_day_total - 1) * 100
+            delta_krw = total - self.previous_day_total
+            delta_line = f"▫️ 전일 대비: {fmt_pnl(delta_krw)} ({fmt_pct(delta_pct)})"
+        else:
+            delta_line = "▫️ 전일 대비: 기준일(최초 리포트)"
+
+        with self.pos.lock:
+            state = self.pos.state
+            ep = self.pos.entry_price
+        position_line = "▫️ 포지션: 없음"
+        if state == "POSITION" and ep > 0 and price > 0:
+            unreal = (price - ep) * btc
+            unreal_pct = (price / ep - 1) * 100
+            position_line = (
+                f"▫️ 포지션: 보유 (평단 {fmt_krw(ep)})\n"
+                f"▫️ 평가손익: {fmt_pnl(unreal)} ({fmt_pct(unreal_pct)})"
+            )
+        elif state == "SETUP":
+            position_line = "▫️ 포지션: SETUP (매수 대기)"
+
+        fng = fetch_fear_greed()
+
+        msg = (
+            "📅 일일 리포트\n"
+            f"{DIVIDER}\n"
+            f"▫️ 총자산: {fmt_krw(total)}\n"
+            f"{delta_line}\n"
+            f"▫️ 누적 실현손익: {fmt_pnl(self.cumulative_pnl)}\n\n"
+            "📊 포지션 현황\n"
+            f"{position_line}\n\n"
+            "🌍 시장 지표\n"
+            f"▫️ BTC/KRW: {fmt_krw(price)}\n"
+            f"▫️ 공포/탐욕: {fng}"
+        )
+        self.noti.send_msg(msg)
+        self.previous_day_total = total
+
+    # ── 텍스트 빌더 (명령어용) ─────────────────────────────────────────
+    def build_status_text(self):
+        krw = self.upbit.get_balance("KRW") or 0.0
+        btc = self.upbit.get_balance(TICKER) or 0.0
+        price = self.current_price or 0.0
+        btc_value = btc * price
+        total = krw + btc_value
+        cash_ratio = (krw / total * 100) if total > 0 else 0.0
+        btc_ratio = (btc_value / total * 100) if total > 0 else 0.0
+
+        with self.pos.lock:
+            state = self.pos.state
+            ep = self.pos.entry_price
+            bp = self.pos.breakout_price
+            tp1 = self.pos.tp1_done
+
+        paused = self.is_paused()
+
+        lines = [
+            "📊 QuantBot 상태",
+            DIVIDER,
+            f"▫️ 상태: {state}" + (" ⏸️" if paused else ""),
+            f"▫️ 현재가: {fmt_krw(price)}",
+            "",
+            "💰 자산",
+            f"▫️ 총자산: {fmt_krw(total)}",
+            f"▫️ BTC: {btc:.8f} ({fmt_krw(btc_value)}, {fmt_pct(btc_ratio, signed=False)})",
+            f"▫️ KRW: {fmt_krw(krw)} ({fmt_pct(cash_ratio, signed=False)})",
+        ]
+        if state == "SETUP":
+            lines += ["", "📈 포지션", f"▫️ 돌파 기준가: {fmt_krw(bp)}"]
+        elif state == "POSITION" and ep > 0 and price > 0:
+            pnl_pct = (price / ep - 1) * 100
+            unreal = (price - ep) * btc
+            lines += [
+                "",
+                "📈 포지션",
+                f"▫️ 평단가: {fmt_krw(ep)}",
+                f"▫️ 수익률: {fmt_pct(pnl_pct)}",
+                f"▫️ 평가손익: {fmt_pnl(unreal)}",
+                f"▫️ 1차 익절: {'완료' if tp1 else '대기'}",
+            ]
+        lines += ["", f"💹 누적 실현손익: {fmt_pnl(self.cumulative_pnl)}"]
+        return "\n".join(lines)
+
+    def build_market_text(self):
+        snap = DataProvider.get_market_snapshot()
+        price = snap.get("price") or self.current_price
+        chg = snap.get("change_pct_24h")
+        vol = snap.get("volume_24h_krw")
+        rsi = snap.get("rsi_15m")
+        atr = snap.get("atr_15m")
+        ema20 = snap.get("ema20_1h")
+        ema50 = snap.get("ema50_1h")
+        adx = snap.get("adx_1h")
+        fng = snap.get("fng")
+
+        if ema20 is not None and ema50 is not None:
+            ema_line = f"▫️ EMA20 {'>' if ema20 > ema50 else '<'} EMA50 " \
+                       f"({'정배열' if ema20 > ema50 else '역배열'})"
+        else:
+            ema_line = "▫️ EMA: N/A"
+
+        if adx is not None:
+            trend_label = "강함" if adx >= 28 else ("보통" if adx >= 20 else "약함")
+            adx_line = f"▫️ ADX(14): {adx:.1f} (추세 {trend_label})"
+        else:
+            adx_line = "▫️ ADX(14): N/A"
+
+        vol_line = f"▫️ 24h 거래대금: {fmt_krw(vol)}" if vol else "▫️ 24h 거래대금: N/A"
+        chg_line = f"▫️ 24h 변동: {fmt_pct(chg)}" if chg is not None else "▫️ 24h 변동: N/A"
+        rsi_line = f"▫️ RSI(14): {rsi:.1f}" if rsi is not None else "▫️ RSI(14): N/A"
+        atr_line = f"▫️ ATR(14): {fmt_krw(atr)}" if atr is not None else "▫️ ATR(14): N/A"
+
+        return (
+            "🌍 시장 스캐닝\n"
+            f"{DIVIDER}\n"
+            f"▫️ BTC/KRW: {fmt_krw(price)}\n"
+            f"{chg_line}\n"
+            f"{vol_line}\n\n"
+            "📊 지표 (15분봉)\n"
+            f"{rsi_line}\n"
+            f"{atr_line}\n\n"
+            "📈 추세 (1시간봉)\n"
+            f"{ema_line}\n"
+            f"{adx_line}\n\n"
+            f"😨 공포/탐욕: {fng}"
+        )
+
+    def build_history_text(self):
+        with self.state_lock:
+            items = list(self.trade_history)[-5:]
+            cum = self.cumulative_pnl
+        if not items:
+            return "📜 최근 거래 내역\n" + DIVIDER + "\n기록 없음"
+
+        lines = ["📜 최근 거래 내역", DIVIDER]
+        for i, t in enumerate(reversed(items), 1):
+            side_emoji = "🔴" if t["side"] == "BUY" else "🔵"
+            pnl_line = f" / {fmt_pnl(t['pnl'])}" if t.get("pnl") is not None else ""
+            lines.append(
+                f"{i}. {t['time']} {side_emoji} {t['side']}\n"
+                f"   {fmt_krw(t['price'])} × {t['volume']:.8f}{pnl_line}\n"
+                f"   근거: {t['reason']}"
+            )
+        lines.append("")
+        lines.append(f"💹 누적 실현손익: {fmt_pnl(cum)}")
+        return "\n".join(lines)
+
+    # ── 긴급 청산 (패닉/수동) ─────────────────────────────────────────
+    def emergency_liquidate(self, reason: str, pause_after: bool):
+        with self.pos.lock:
+            ep = self.pos.entry_price
+            was_in_position = self.pos.state == "POSITION"
+        price = self.current_price
+
+        ok, sold = self.executor.safe_market_sell(TICKER, 1.0)
+        if not ok:
+            self.noti.send_msg("❌ 매도 실패. 업비트 잔고나 API 상태를 확인하세요.")
+            return
+
+        realized = None
+        if was_in_position and ep > 0 and sold > 0 and price > 0:
+            realized = (price - ep) * sold
+        self.record_trade("SELL", price, sold, reason, pnl=realized)
+        self.pos.reset()
+
+        if pause_after:
+            self.set_paused(True)
+
+        krw = self.upbit.get_balance("KRW") or 0.0
+        btc = self.upbit.get_balance(TICKER) or 0.0
+        total = krw + (btc * price if price else 0.0)
+
+        msg = (
+            f"🔵 [긴급 전량매도 완료]\n{DIVIDER}\n"
+            f"▫️ 매도가: {fmt_krw(price)}\n"
+            f"▫️ 체결량: {sold:.8f} BTC\n"
+        )
+        if realized is not None:
+            msg += f"▫️ 확정 손익: {fmt_pnl(realized)}\n"
+        msg += (
+            f"\n💰 현재 잔고: {fmt_krw(krw)} (총자산 {fmt_krw(total)})\n"
+            f"💹 누적 실현손익: {fmt_pnl(self.cumulative_pnl)}"
+        )
+        if pause_after:
+            msg += "\n\n⏸️ 일시정지 ON — /resume 으로 재개"
+        self.noti.send_msg(msg)
+
+    # ── 알림 빌더 (매수/매도) ─────────────────────────────────────────
+    def _send_buy_notice(self, fill_price, atr, reason):
+        krw = self.upbit.get_balance("KRW") or 0.0
+        btc = self.upbit.get_balance(TICKER) or 0.0
+        btc_value = btc * fill_price if fill_price else 0.0
+        total = krw + btc_value
+        cash_ratio = (krw / total * 100) if total > 0 else 0.0
+
+        self.noti.send_msg(
+            f"🔴 [신규 매수 체결] BTC/KRW\n{DIVIDER}\n"
+            f"▫️ 매수가: {fmt_krw(fill_price)}\n"
+            f"▫️ 체결량: {btc:.8f} BTC ({fmt_krw(btc_value)})\n"
+            f"▫️ ATR(15m): {fmt_krw(atr)}\n"
+            f"▫️ 매수 근거: {reason}\n\n"
+            f"💰 현재 잔고: {fmt_krw(krw)} (잔여 비중 {fmt_pct(cash_ratio, signed=False)})"
+        )
+
+    def _send_sell_notice(self, header, fill_price, sold_volume, reason, realized):
+        krw = self.upbit.get_balance("KRW") or 0.0
+        btc = self.upbit.get_balance(TICKER) or 0.0
+        total = krw + (btc * fill_price if fill_price else 0.0)
+
+        msg = (
+            f"{header}\n{DIVIDER}\n"
+            f"▫️ 매도가: {fmt_krw(fill_price)}\n"
+            f"▫️ 체결량: {sold_volume:.8f} BTC\n"
+            f"▫️ 매도 근거: {reason}\n"
+        )
+        if realized is not None:
+            msg += f"▫️ 확정 손익: {fmt_pnl(realized)}\n"
+        msg += (
+            f"\n💰 현재 잔고: {fmt_krw(krw)} (총자산 {fmt_krw(total)})\n"
+            f"💹 누적 실현손익: {fmt_pnl(self.cumulative_pnl)}"
+        )
+        self.noti.send_msg(msg)
+
+    # ── 메인 루프 ──────────────────────────────────────────────────────
     def run(self):
         self.noti.start_listening()
-        self.noti.send_msg("🚀 V4.0 봇 시작\n안내 명령어: /all")
+        self.noti.send_msg(
+            f"⚙️ QuantBot V4.0 기동\n{DIVIDER}\n"
+            "▫️ 명령어 안내: /all"
+        )
         logger.info("메인 루프 시작")
 
         while True:
             try:
                 now = datetime.datetime.now()
                 self.check_websocket_health()
+                self.check_memory()
+                self.maybe_send_daily_briefing()
+
                 if self.current_price <= 0:
                     time.sleep(0.5)
                     continue
@@ -373,9 +864,15 @@ class QuantStrategy:
                         self.flash_crash_until = now + datetime.timedelta(hours=6)
                         self.pos.reset()
                         logger.warning("서킷 브레이커 발동: 6시간 진입 차단")
-                        self.noti.send_msg("🚨 서킷 브레이커 발동. 6시간 신규 진입 금지")
+                        self.noti.send_msg(
+                            "🚨 서킷 브레이커 발동\n"
+                            f"{DIVIDER}\n"
+                            "▫️ 5분봉 -5% 이상 급락 감지\n"
+                            "▫️ 6시간 신규 진입 차단"
+                        )
 
                 is_locked = (now < self.cooldown_until) or (now < self.flash_crash_until)
+                paused = self.is_paused()
 
                 if (now - self.last_data_fetch).total_seconds() >= 60:
                     data_1h, data_15m = DataProvider.get_market_data()
@@ -392,7 +889,14 @@ class QuantStrategy:
                         current_state = self.pos.state
                         breakout_price = self.pos.breakout_price
 
-                    if current_state == "IDLE" and not is_locked:
+                    # 일시정지 중에는 신규 진입/SETUP 모두 차단 (SETUP 대기는 취소)
+                    if paused and current_state in ("IDLE", "SETUP"):
+                        if current_state == "SETUP":
+                            self.pos.reset()
+                            logger.info("SETUP 취소: 일시정지")
+                            self.noti.send_msg("⏸️ SETUP 취소 (일시정지)")
+
+                    elif current_state == "IDLE" and not is_locked:
                         is_uptrend = (
                             (data_1h["adx"] > 28)
                             and (data_1h["ema20"] > data_1h["ema50"])
@@ -400,8 +904,17 @@ class QuantStrategy:
                         )
                         if is_uptrend and (self.current_price > highest_target):
                             self.pos.enter_setup(highest_target)
+                            self.last_entry_reason = (
+                                f"15분봉 Highest_40 돌파 (ADX {data_1h['adx']:.1f})"
+                            )
                             logger.info(f"SETUP 진입 (기준가 {highest_target:,.0f})")
-                            self.noti.send_msg(f"🟡 SETUP 진입 (기준가 {highest_target:,.0f})")
+                            self.noti.send_msg(
+                                "🟡 SETUP 진입\n"
+                                f"{DIVIDER}\n"
+                                f"▫️ 돌파 기준가: {fmt_krw(highest_target)}\n"
+                                f"▫️ ADX(1h): {data_1h['adx']:.1f}\n"
+                                "▫️ 돌파 안착 확인 대기 중"
+                            )
 
                     elif current_state == "SETUP" and not is_locked:
                         if data_1h["adx"] < 28 or data_1h["ema20"] < data_1h["ema50"]:
@@ -432,7 +945,11 @@ class QuantStrategy:
                                         if actual_btc_bal > 0 and avg_buy > 0 and (actual_btc_bal * avg_buy) > 5000:
                                             self.pos.enter_position(avg_buy, atr_15m)
                                             logger.info(f"POSITION 진입 (평단 {avg_buy:,.0f})")
-                                            self.noti.send_msg(f"🔴 POSITION 진입\n평단가: {avg_buy:,.0f}원")
+                                            reason = self.last_entry_reason or "15분봉 돌파 안착"
+                                            self.record_trade(
+                                                "BUY", avg_buy, actual_btc_bal, reason, pnl=None
+                                            )
+                                            self._send_buy_notice(avg_buy, atr_15m, reason)
                                         else:
                                             self.pos.reset()
                                             logger.warning("잔고 검증 실패로 포지션 롤백")
@@ -448,6 +965,7 @@ class QuantStrategy:
                                 self.pos.reset()
                                 logger.info("SETUP 취소: 돌파 안착 실패")
 
+                # 포지션 청산 (일시정지와 무관하게 항상 동작)
                 with self.pos.lock:
                     in_position = self.pos.state == "POSITION" and self.pos.entry_price > 0
                     ep = self.pos.entry_price
@@ -461,28 +979,50 @@ class QuantStrategy:
                     tp2_price = ep + (8.0 * safe_atr)
 
                     if self.current_price <= stop_price:
-                        if self.executor.safe_market_sell(TICKER, 1.0):
+                        ok, sold = self.executor.safe_market_sell(TICKER, 1.0)
+                        if ok:
+                            realized = (self.current_price - ep) * sold if sold > 0 else 0.0
                             if tp1_done:
-                                logger.info("약익절 컷 완료")
-                                self.noti.send_msg("🛡️ 약익절 컷 완료 (+0.5 ATR)")
+                                reason = "약익절 컷 (+0.5 ATR 트레일)"
+                                header = "🛡️ [약익절 컷 완료]"
                             else:
+                                reason = "손절 (-1.5 ATR)"
+                                header = "📉 [손절 체결]"
                                 self.cooldown_until = now + datetime.timedelta(hours=3)
-                                logger.info("손절 완료, 3시간 쿨다운")
-                                self.noti.send_msg("🩸 손절 완료 → 3시간 쿨다운")
+                            self.record_trade("SELL", self.current_price, sold, reason, pnl=realized)
+                            self._send_sell_notice(header, self.current_price, sold, reason, realized)
+                            if not tp1_done:
+                                self.noti.send_msg(
+                                    "⏳ 3시간 쿨다운 시작\n"
+                                    f"{DIVIDER}\n"
+                                    "▫️ 손절 이후 뇌동매매 방지"
+                                )
                             self.pos.reset()
 
                     elif self.current_price >= tp1_price and not tp1_done:
-                        if self.executor.safe_market_sell(TICKER, 0.3):
+                        ok, sold = self.executor.safe_market_sell(TICKER, 0.3)
+                        if ok:
+                            realized = (self.current_price - ep) * sold if sold > 0 else 0.0
+                            reason = "1차 익절 +2.0 ATR (30%)"
                             with self.pos.lock:
                                 self.pos.tp1_done = True
-                            logger.info("1차 익절 30% 완료")
-                            self.noti.send_msg("🔵 1차 익절 30% 완료 → 스탑 +0.5 ATR")
+                            self.record_trade("SELL", self.current_price, sold, reason, pnl=realized)
+                            self._send_sell_notice(
+                                "🔵 [1차 익절 체결 +2.0 ATR]",
+                                self.current_price, sold, reason, realized,
+                            )
 
                     elif self.current_price >= tp2_price and tp1_done:
-                        if self.executor.safe_market_sell(TICKER, 1.0):
+                        ok, sold = self.executor.safe_market_sell(TICKER, 1.0)
+                        if ok:
+                            realized = (self.current_price - ep) * sold if sold > 0 else 0.0
+                            reason = "2차 최종 익절 +8.0 ATR (전량)"
+                            self.record_trade("SELL", self.current_price, sold, reason, pnl=realized)
+                            self._send_sell_notice(
+                                "🔥 [최종 익절 체결 +8.0 ATR]",
+                                self.current_price, sold, reason, realized,
+                            )
                             self.pos.reset()
-                            logger.info("2차 최종 익절 완료")
-                            self.noti.send_msg("🔥 2차 최종 익절 완료")
 
             except Exception as e:
                 now = datetime.datetime.now()
