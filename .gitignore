@@ -1,4 +1,8 @@
 .env
+.claude/
+bot_state.json
+backtest_results.json
+*.pkl
 *.log
 venv/
 __pycache__/

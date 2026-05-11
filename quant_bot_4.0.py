@@ -10,6 +10,7 @@ import queue
 from collections import deque
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 import pyupbit
@@ -56,6 +57,7 @@ SECRET_KEY = os.getenv("UPBIT_SECRET_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TICKER = "KRW-BTC"
+KST = ZoneInfo("Asia/Seoul")
 
 STATE_FILE = Path(__file__).resolve().parent / "bot_state.json"
 FNG_URL = "https://api.alternative.me/fng/?limit=1"
@@ -119,6 +121,30 @@ def fmt_pnl(v):
     sign = "+" if v >= 0 else ""
     icon = "📈" if v >= 0 else "📉"
     return f"<b>{sign}{v:,.0f}원</b> {icon}"
+
+
+def now_kst():
+    return datetime.datetime.now(KST)
+
+
+def dt_to_iso(dt):
+    if not isinstance(dt, datetime.datetime):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=KST)
+    return dt.isoformat()
+
+
+def parse_kst_dt(value, default=None):
+    if not value:
+        return default if default is not None else now_kst()
+    try:
+        dt = datetime.datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=KST)
+        return dt.astimezone(KST)
+    except Exception:
+        return default if default is not None else now_kst()
 
 
 def fetch_fear_greed():
@@ -256,6 +282,24 @@ class Position:
             self.entry_price = avg_buy_price
             self.tp1_done = False
 
+    def restore(self, data):
+        with self.lock:
+            self.state = data.get("state", "IDLE")
+            self.entry_price = float(data.get("entry_price", 0.0) or 0.0)
+            self.atr_at_entry = float(data.get("atr_at_entry", 0.0) or 0.0)
+            self.breakout_price = float(data.get("breakout_price", 0.0) or 0.0)
+            self.tp1_done = bool(data.get("tp1_done", False))
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "state": self.state,
+                "entry_price": self.entry_price,
+                "atr_at_entry": self.atr_at_entry,
+                "breakout_price": self.breakout_price,
+                "tp1_done": self.tp1_done,
+            }
+
 
 class RiskManager:
     @staticmethod
@@ -305,9 +349,11 @@ class Execution:
             for _ in range(5):
                 time.sleep(1)
                 current_volume = self.upbit.get_balance(ticker)
-                if volume_ratio >= 0.99 and current_volume < initial_volume * 0.1:
-                    return True, sell_volume
-                if volume_ratio == 0.3 and current_volume < initial_volume * 0.75:
+                if current_volume is None:
+                    continue
+                expected_remaining = max(0.0, initial_volume - sell_volume)
+                tolerance = max(initial_volume * 0.01, sell_volume * 0.05, 1e-8)
+                if current_volume <= expected_remaining + tolerance:
                     return True, sell_volume
             logger.warning("체결 확인 실패: 잔고 변동 부족")
             return False, 0.0
@@ -479,19 +525,19 @@ class QuantStrategy:
         self.noti = TelegramManager(TELEGRAM_TOKEN, CHAT_ID, self)
 
         self.current_price = 0.0
-        self.last_ws_update = datetime.datetime.now()
-        self.cooldown_until = datetime.datetime.now()
-        self.flash_crash_until = datetime.datetime.now()
-        self.last_data_fetch = datetime.datetime.now() - datetime.timedelta(minutes=1)
+        self.last_ws_update = now_kst()
+        self.cooldown_until = now_kst()
+        self.flash_crash_until = now_kst()
+        self.last_data_fetch = now_kst() - datetime.timedelta(minutes=1)
         self.last_closed_candle_time = None
-        self.last_error_time = datetime.datetime.now() - datetime.timedelta(hours=1)
-        self.last_mem_warn = datetime.datetime.now() - datetime.timedelta(hours=1)
-        self.last_mem_check = datetime.datetime.now() - datetime.timedelta(seconds=60)
+        self.last_error_time = now_kst() - datetime.timedelta(hours=1)
+        self.last_mem_warn = now_kst() - datetime.timedelta(hours=1)
+        self.last_mem_check = now_kst() - datetime.timedelta(seconds=60)
         self.wm = None
 
         self.last_entry_reason = ""
 
-        self.state_lock = threading.Lock()
+        self.state_lock = threading.RLock()
         self.is_paused_flag = False
         self.trade_history = deque(maxlen=10)
         self.cumulative_pnl = 0.0
@@ -512,6 +558,10 @@ class QuantStrategy:
             self.cumulative_pnl = float(data.get("cumulative_pnl", 0.0))
             self.previous_day_total = data.get("previous_day_total")
             self.last_briefing_date = data.get("last_briefing_date")
+            self.cooldown_until = parse_kst_dt(data.get("cooldown_until"), now_kst())
+            self.flash_crash_until = parse_kst_dt(data.get("flash_crash_until"), now_kst())
+            self.is_paused_flag = bool(data.get("is_paused", False))
+            self.pos.restore(data.get("position", {}))
             for t in data.get("trade_history", [])[-10:]:
                 self.trade_history.append(t)
             logger.info(f"상태 파일 로드: 누적 PnL {self.cumulative_pnl:,.0f}원")
@@ -525,6 +575,10 @@ class QuantStrategy:
                     "cumulative_pnl": self.cumulative_pnl,
                     "previous_day_total": self.previous_day_total,
                     "last_briefing_date": self.last_briefing_date,
+                    "cooldown_until": dt_to_iso(self.cooldown_until),
+                    "flash_crash_until": dt_to_iso(self.flash_crash_until),
+                    "is_paused": self.is_paused(),
+                    "position": self.pos.snapshot(),
                     "trade_history": list(self.trade_history),
                 }, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -535,6 +589,7 @@ class QuantStrategy:
         with self.state_lock:
             self.is_paused_flag = bool(val)
         logger.info(f"pause 플래그 설정: {val}")
+        self._save_state()
 
     def is_paused(self):
         with self.state_lock:
@@ -543,7 +598,7 @@ class QuantStrategy:
     # ── 거래 기록 ──────────────────────────────────────────────────────
     def record_trade(self, side, price, volume, reason, pnl=None):
         entry = {
-            "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "time": now_kst().strftime("%Y-%m-%d %H:%M:%S"),
             "side": side,
             "price": float(price) if price else 0.0,
             "volume": float(volume) if volume else 0.0,
@@ -565,7 +620,7 @@ class QuantStrategy:
             self.wm = pyupbit.WebSocketManager("ticker", [TICKER])
             self.wm.alive = True
             self.wm.start()
-            self.last_ws_update = datetime.datetime.now()
+            self.last_ws_update = now_kst()
             logger.info("웹소켓 초기화 성공")
         except Exception as e:
             logger.error(f"웹소켓 초기화 실패: {e}")
@@ -575,13 +630,24 @@ class QuantStrategy:
             btc_bal = self.upbit.get_balance(TICKER)
             avg_buy_price = self.upbit.get_avg_buy_price(TICKER)
             if btc_bal and avg_buy_price and (btc_bal * avg_buy_price) > 5000:
-                self.pos.sync_to_existing_position(avg_buy_price)
+                with self.pos.lock:
+                    already_restored = self.pos.state == "POSITION" and self.pos.entry_price > 0
+                if not already_restored:
+                    self.pos.sync_to_existing_position(avg_buy_price)
+                    self._save_state()
                 logger.info(f"기존 보유 동기화 완료 (평단 {avg_buy_price:,.0f})")
+            else:
+                with self.pos.lock:
+                    stale_state = self.pos.state != "IDLE"
+                if stale_state:
+                    self.pos.reset()
+                    self._save_state()
+                    logger.info("실보유 BTC 없음: 저장된 포지션 상태 초기화")
         except Exception as e:
             logger.warning(f"초기 계좌 동기화 실패: {e}")
 
     def check_websocket_health(self):
-        now = datetime.datetime.now()
+        now = now_kst()
         try:
             drained = 0
             latest_price = None
@@ -621,7 +687,7 @@ class QuantStrategy:
 
     # ── 메모리 모니터링 ────────────────────────────────────────────────
     def check_memory(self):
-        now = datetime.datetime.now()
+        now = now_kst()
         if (now - self.last_mem_check).total_seconds() < 60:
             return
         self.last_mem_check = now
@@ -641,7 +707,7 @@ class QuantStrategy:
 
     # ── 일일 브리핑 ────────────────────────────────────────────────────
     def maybe_send_daily_briefing(self):
-        now = datetime.datetime.now()
+        now = now_kst()
         today_str = now.strftime("%Y-%m-%d")
         if now.hour != 9:
             return
@@ -832,6 +898,7 @@ class QuantStrategy:
             realized = (price - ep) * sold
         self.record_trade("SELL", price, sold, reason, pnl=realized)
         self.pos.reset()
+        self._save_state()
 
         if pause_after:
             self.set_paused(True)
@@ -913,7 +980,7 @@ class QuantStrategy:
 
         while True:
             try:
-                now = datetime.datetime.now()
+                now = now_kst()
                 self.check_websocket_health()
                 self.check_memory()
                 self.maybe_send_daily_briefing()
@@ -922,16 +989,25 @@ class QuantStrategy:
                     time.sleep(0.5)
                     continue
 
-                if now.minute % 5 == 0 and now.second < 2:
+                if now.minute % 5 == 0 and now.second < 2 and now >= self.flash_crash_until:
                     if DataProvider.is_flash_crash_active():
                         self.flash_crash_until = now + datetime.timedelta(hours=6)
-                        self.pos.reset()
                         logger.warning("서킷 브레이커 발동: 6시간 진입 차단")
                         self.noti.send_msg(
                             f"🚨 {b('[서킷 브레이커 발동]')}\n\n"
                             "▫️ 5분봉 -5% 이상 급락 감지\n"
-                            "▫️ <b>6시간 신규 진입 차단</b>"
+                            "▫️ <b>6시간 신규 진입 차단</b>\n"
+                            "▫️ 보유 포지션은 즉시 전량 청산 시도"
                         )
+                        with self.pos.lock:
+                            flash_state = self.pos.state
+                        if flash_state == "POSITION":
+                            self.emergency_liquidate(reason="플래시 크래시 서킷브레이커", pause_after=False)
+                        elif flash_state == "SETUP":
+                            self.pos.reset()
+                            self._save_state()
+                        else:
+                            self._save_state()
 
                 is_locked = (now < self.cooldown_until) or (now < self.flash_crash_until)
                 paused = self.is_paused()
@@ -942,12 +1018,15 @@ class QuantStrategy:
                     if data_1h is None:
                         continue
 
-                    atr_15m = data_15m["atr"].iloc[-1]
-                    rsi_15m = data_15m["rsi"].iloc[-1]
-                    cur_volume_15m = data_15m["volume"].iloc[-1]
-                    vol_ma20_15m = data_15m["vol_ma20"].iloc[-1]
-                    highest_target = data_15m["highest_60"].iloc[-1]
-                    prev_close_15m = data_15m["close"].iloc[-2]
+                    if len(data_15m) < 2:
+                        continue
+                    closed_15m = data_15m.iloc[-2]
+                    atr_15m = closed_15m["atr"]
+                    rsi_15m = closed_15m["rsi"]
+                    cur_volume_15m = closed_15m["volume"]
+                    vol_ma20_15m = closed_15m["vol_ma20"]
+                    highest_target = closed_15m["highest_60"]
+                    closed_close_15m = closed_15m["close"]
                     current_closed_candle_time = data_15m.index[-2]
 
                     with self.pos.lock:
@@ -957,6 +1036,7 @@ class QuantStrategy:
                     if paused and current_state in ("IDLE", "SETUP"):
                         if current_state == "SETUP":
                             self.pos.reset()
+                            self._save_state()
                             logger.info("SETUP 취소: 일시정지")
                             self.noti.send_msg(f"⏸️ {b('SETUP 취소')} (일시정지)")
 
@@ -982,6 +1062,8 @@ class QuantStrategy:
                                 and (self.current_price > highest_target)
                                 and rsi_ok and vol_ok and time_ok):
                             self.pos.enter_setup(highest_target)
+                            self.last_closed_candle_time = current_closed_candle_time
+                            self._save_state()
                             self.last_entry_reason = (
                                 f"15분봉 Highest_60 돌파 "
                                 f"(ADX {data_1h['adx']:.1f}, RSI {rsi_15m:.1f})"
@@ -999,15 +1081,17 @@ class QuantStrategy:
                     elif current_state == "SETUP" and not is_locked:
                         if data_1h["adx"] < 28 or data_1h["ema20"] < data_1h["ema50"]:
                             self.pos.reset()
+                            self._save_state()
                             logger.info("SETUP 취소: 상위 추세 붕괴")
                             self.noti.send_msg(f"🚫 {b('SETUP 취소')} (상위 추세 붕괴)")
                             continue
 
                         if self.last_closed_candle_time != current_closed_candle_time:
                             self.last_closed_candle_time = current_closed_candle_time
-                            if prev_close_15m > breakout_price:
+                            if closed_close_15m > breakout_price:
                                 if (atr_15m / self.current_price) < 0.0015:
                                     self.pos.reset()
+                                    self._save_state()
                                     logger.info("SETUP 취소: 변동성 부족")
                                     self.noti.send_msg(f"🚫 {b('SETUP 취소')} (변동성 0.15% 미만)")
                                     continue
@@ -1024,6 +1108,7 @@ class QuantStrategy:
                                         avg_buy = self.upbit.get_avg_buy_price(TICKER)
                                         if actual_btc_bal > 0 and avg_buy > 0 and (actual_btc_bal * avg_buy) > 5000:
                                             self.pos.enter_position(avg_buy, atr_15m)
+                                            self._save_state()
                                             logger.info(f"POSITION 진입 (평단 {avg_buy:,.0f})")
                                             reason = self.last_entry_reason or "15분봉 돌파 안착"
                                             self.record_trade(
@@ -1034,21 +1119,25 @@ class QuantStrategy:
                                             )
                                         else:
                                             self.pos.reset()
+                                            self._save_state()
                                             logger.warning("잔고 검증 실패로 포지션 롤백")
                                             self.noti.send_msg(
                                                 f"⚠️ {b('매수 후 잔고 검증 실패')}. SETUP 해제"
                                             )
                                     else:
                                         self.pos.reset()
+                                        self._save_state()
                                         logger.warning("매수 주문 실패")
                                         self.noti.send_msg(
                                             f"⚠️ {b('매수 주문 실패')}. SETUP 해제"
                                         )
                                 else:
                                     self.pos.reset()
+                                    self._save_state()
                                     logger.info("SETUP 취소: 예산 5000원 미만")
                             else:
                                 self.pos.reset()
+                                self._save_state()
                                 logger.info("SETUP 취소: 돌파 안착 실패")
 
                 with self.pos.lock:
@@ -1082,6 +1171,7 @@ class QuantStrategy:
                                     "▫️ 손절 이후 뇌동매매 방지"
                                 )
                             self.pos.reset()
+                            self._save_state()
 
                     elif self.current_price >= tp1_price and not tp1_done:
                         ok, sold = self.executor.safe_market_sell(TICKER, 0.4)
@@ -1090,6 +1180,7 @@ class QuantStrategy:
                             reason = "1차 익절 +2.0 ATR (40%)"
                             with self.pos.lock:
                                 self.pos.tp1_done = True
+                            self._save_state()
                             self.record_trade("SELL", self.current_price, sold, reason, pnl=realized)
                             self._send_sell_notice(
                                 f"🔵 {b('[1차 익절 체결] +2.0 ATR (40%)')}",
@@ -1107,9 +1198,10 @@ class QuantStrategy:
                                 self.current_price, sold, reason, realized,
                             )
                             self.pos.reset()
+                            self._save_state()
 
             except Exception as e:
-                now = datetime.datetime.now()
+                now = now_kst()
                 if (now - self.last_error_time).total_seconds() > 60:
                     logger.error(f"메인 루프 에러: {e}", exc_info=True)
                     self.noti.send_msg(f"🚨 {b('봇 에러')}: {esc(e)}")
