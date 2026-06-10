@@ -59,6 +59,20 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TICKER = "KRW-BTC"
 KST = ZoneInfo("Asia/Seoul")
 
+# ── 전략 파라미터 (walkforward.py 검증 결과 기반 — strategy.md 참고) ──────
+ADX_MIN     = 28      # 1h ADX 추세 강도 하한
+HIGHEST_N   = 60      # 15m 돌파 기준 최고가 봉 수
+ATR_MIN_PCT = 0.0015  # 최소 변동성 (ATR/가격)
+RSI_MAX     = 76      # 15m RSI 과매수 차단
+VOL_MULT    = 1.3     # 진입봉 거래량 > 20봉 평균 × 배수
+BLOCK_HOUR_START, BLOCK_HOUR_END = 1, 4  # KST 진입 차단 시간대 (유동성 저조)
+SL_ATR      = 1.5     # 손절: 진입가 - ATR 배수
+TP1_ATR     = 2.0     # 1차 익절: 진입가 + ATR 배수
+TP1_RATIO   = 0.4     # 1차 익절 매도 비율
+TP2_ATR     = 6.0     # 2차 익절: 진입가 + ATR 배수
+TRAIL_ATR   = 1.2     # TP1 이후 트레일 스탑: 진입가 + ATR 배수
+FEE_RATE    = 0.0005  # 업비트 단방향 수수료 0.05%
+
 STATE_FILE = Path(__file__).resolve().parent / "bot_state.json"
 FNG_URL = "https://api.alternative.me/fng/?limit=1"
 
@@ -147,6 +161,13 @@ def parse_kst_dt(value, default=None):
         return default if default is not None else now_kst()
 
 
+def calc_realized_pnl(fill_price, entry_price, volume):
+    """수수료 반영 실현손익. 매수·매도 수수료를 모두 차감한 순손익."""
+    if not (fill_price and entry_price and volume):
+        return 0.0
+    return volume * (fill_price * (1 - FEE_RATE) - entry_price * (1 + FEE_RATE))
+
+
 def fetch_fear_greed():
     try:
         r = requests.get(FNG_URL, timeout=5)
@@ -182,7 +203,7 @@ class DataProvider:
                 df_15m["close"], window=14
             ).rsi()
             df_15m["vol_ma20"] = df_15m["volume"].rolling(window=20).mean()
-            df_15m["highest_60"] = df_15m["high"].shift(1).rolling(window=60).max()
+            df_15m["highest"] = df_15m["high"].shift(1).rolling(window=HIGHEST_N).max()
 
             return df_1h.iloc[-1], df_15m
         except Exception as e:
@@ -307,7 +328,7 @@ class RiskManager:
         if atr_value <= 0 or current_price <= 0:
             return 0.0
         risk_amount = krw_balance * 0.01
-        stop_loss_pct = (1.5 * atr_value) / current_price
+        stop_loss_pct = (SL_ATR * atr_value) / current_price
         return min(risk_amount / stop_loss_pct, krw_balance * 0.5)
 
 
@@ -331,20 +352,21 @@ class Execution:
             return None
 
     def safe_market_sell(self, ticker, volume_ratio=1.0):
-        """매도 실행. 반환: (성공 여부, 체결 추정 수량)."""
+        """매도 실행. 반환: (성공 여부, 체결 추정 수량, 주문 uuid)."""
         try:
             initial_volume = self.upbit.get_balance(ticker)
             if initial_volume is None:
                 logger.error("매도 잔고 조회 실패 (None 반환) — 매도 취소")
-                return False, 0.0
+                return False, 0.0, None
             sell_volume = round(initial_volume * volume_ratio, 8)
             if sell_volume <= 0:
-                return False, 0.0
+                return False, 0.0, None
 
             order = self.upbit.sell_market_order(ticker, sell_volume)
             if order is None or (isinstance(order, dict) and "error" in order):
                 logger.error(f"매도 API 거절: {order}")
-                return False, 0.0
+                return False, 0.0, None
+            uuid = order.get("uuid") if isinstance(order, dict) else None
 
             for _ in range(5):
                 time.sleep(1)
@@ -354,12 +376,30 @@ class Execution:
                 expected_remaining = max(0.0, initial_volume - sell_volume)
                 tolerance = max(initial_volume * 0.01, sell_volume * 0.05, 1e-8)
                 if current_volume <= expected_remaining + tolerance:
-                    return True, sell_volume
+                    return True, sell_volume, uuid
             logger.warning("체결 확인 실패: 잔고 변동 부족")
-            return False, 0.0
+            return False, 0.0, uuid
         except Exception as e:
             logger.error(f"매도 실행 에러: {e}")
-            return False, 0.0
+            return False, 0.0, None
+
+    def get_avg_fill_price(self, uuid, fallback_price):
+        """주문 체결 내역 기반 평균 체결가. 조회 실패 시 fallback 가격."""
+        if not uuid:
+            return fallback_price
+        try:
+            for _ in range(3):
+                od = self.upbit.get_order(uuid)
+                trades = od.get("trades") if isinstance(od, dict) else None
+                if trades:
+                    vol = sum(float(t["volume"]) for t in trades)
+                    funds = sum(float(t["funds"]) for t in trades)
+                    if vol > 0:
+                        return funds / vol
+                time.sleep(0.7)
+        except Exception as e:
+            logger.warning(f"체결가 조회 실패({uuid}): {e}")
+        return fallback_price
 
 
 # ── 텔레그램 ────────────────────────────────────────────────────────────────
@@ -888,15 +928,17 @@ class QuantStrategy:
             was_in_position = self.pos.state == "POSITION"
         price = self.current_price
 
-        ok, sold = self.executor.safe_market_sell(TICKER, 1.0)
+        ok, sold, uuid = self.executor.safe_market_sell(TICKER, 1.0)
         if not ok:
             self.noti.send_msg(f"❌ {b('매도 실패.')} 업비트 잔고나 API 상태를 확인하세요.")
             return
 
+        fill = self.executor.get_avg_fill_price(uuid, price)
         realized = None
-        if was_in_position and ep > 0 and sold > 0 and price > 0:
-            realized = (price - ep) * sold
-        self.record_trade("SELL", price, sold, reason, pnl=realized)
+        if was_in_position and ep > 0 and sold > 0:
+            realized = calc_realized_pnl(fill, ep, sold)
+        self.record_trade("SELL", fill, sold, reason, pnl=realized)
+        price = fill or price
         self.pos.reset()
         self._save_state()
 
@@ -1025,7 +1067,7 @@ class QuantStrategy:
                     rsi_15m = closed_15m["rsi"]
                     cur_volume_15m = closed_15m["volume"]
                     vol_ma20_15m = closed_15m["vol_ma20"]
-                    highest_target = closed_15m["highest_60"]
+                    highest_target = closed_15m["highest"]
                     closed_close_15m = closed_15m["close"]
                     current_closed_candle_time = data_15m.index[-2]
 
@@ -1042,21 +1084,21 @@ class QuantStrategy:
 
                     elif current_state == "IDLE" and not is_locked:
                         is_uptrend = (
-                            (data_1h["adx"] > 28)
+                            (data_1h["adx"] > ADX_MIN)
                             and (data_1h["ema20"] > data_1h["ema50"])
                             and (self.current_price > data_1h["ema20"] * 1.005)
                         )
-                        # ── 추가 진입 필터 (백테스트 최적화 결과 반영) ───────────
-                        # ① RSI 과매수 차단 (15m RSI < 76)
-                        rsi_ok = (rsi_15m is not None) and (rsi_15m < 76)
-                        # ② 거래량 확인 (현재봉 거래량 > 1.3 × 20봉 평균)
+                        # ── 추가 진입 필터 (walk-forward 검증 결과 반영) ─────────
+                        # ① RSI 과매수 차단
+                        rsi_ok = (rsi_15m is not None) and (rsi_15m < RSI_MAX)
+                        # ② 거래량 확인 (현재봉 거래량 > VOL_MULT × 20봉 평균)
                         vol_ok = (
                             vol_ma20_15m is not None and vol_ma20_15m > 0
-                            and cur_volume_15m > vol_ma20_15m * 1.3
+                            and cur_volume_15m > vol_ma20_15m * VOL_MULT
                         )
-                        # ③ 시간 필터 (KST 01~04시 유동성 저조 구간 차단)
+                        # ③ 시간 필터 (유동성 저조 구간 차단)
                         kst_hour = now.hour
-                        time_ok = not (1 <= kst_hour <= 4)
+                        time_ok = not (BLOCK_HOUR_START <= kst_hour <= BLOCK_HOUR_END)
 
                         if (is_uptrend
                                 and (self.current_price > highest_target)
@@ -1065,7 +1107,7 @@ class QuantStrategy:
                             self.last_closed_candle_time = current_closed_candle_time
                             self._save_state()
                             self.last_entry_reason = (
-                                f"15분봉 Highest_60 돌파 "
+                                f"15분봉 Highest_{HIGHEST_N} 돌파 "
                                 f"(ADX {data_1h['adx']:.1f}, RSI {rsi_15m:.1f})"
                             )
                             logger.info(f"SETUP 진입 (기준가 {highest_target:,.0f})")
@@ -1079,7 +1121,7 @@ class QuantStrategy:
                             )
 
                     elif current_state == "SETUP" and not is_locked:
-                        if data_1h["adx"] < 28 or data_1h["ema20"] < data_1h["ema50"]:
+                        if data_1h["adx"] < ADX_MIN or data_1h["ema20"] < data_1h["ema50"]:
                             self.pos.reset()
                             self._save_state()
                             logger.info("SETUP 취소: 상위 추세 붕괴")
@@ -1089,11 +1131,11 @@ class QuantStrategy:
                         if self.last_closed_candle_time != current_closed_candle_time:
                             self.last_closed_candle_time = current_closed_candle_time
                             if closed_close_15m > breakout_price:
-                                if (atr_15m / self.current_price) < 0.0015:
+                                if (atr_15m / self.current_price) < ATR_MIN_PCT:
                                     self.pos.reset()
                                     self._save_state()
                                     logger.info("SETUP 취소: 변동성 부족")
-                                    self.noti.send_msg(f"🚫 {b('SETUP 취소')} (변동성 0.15% 미만)")
+                                    self.noti.send_msg(f"🚫 {b('SETUP 취소')} (변동성 {ATR_MIN_PCT*100:.2f}% 미만)")
                                     continue
 
                                 krw_bal = self.upbit.get_balance("KRW")
@@ -1106,7 +1148,7 @@ class QuantStrategy:
                                         time.sleep(1.5)
                                         actual_btc_bal = self.upbit.get_balance(TICKER)
                                         avg_buy = self.upbit.get_avg_buy_price(TICKER)
-                                        if actual_btc_bal > 0 and avg_buy > 0 and (actual_btc_bal * avg_buy) > 5000:
+                                        if actual_btc_bal and avg_buy and (actual_btc_bal * avg_buy) > 5000:
                                             self.pos.enter_position(avg_buy, atr_15m)
                                             self._save_state()
                                             logger.info(f"POSITION 진입 (평단 {avg_buy:,.0f})")
@@ -1148,23 +1190,24 @@ class QuantStrategy:
 
                 if in_position:
                     safe_atr = atr_entry if atr_entry > 0 else ep * 0.02
-                    stop_price = ep + (1.2 * safe_atr) if tp1_done else ep - (1.5 * safe_atr)
-                    tp1_price = ep + (2.0 * safe_atr)
-                    tp2_price = ep + (6.0 * safe_atr)
+                    stop_price = ep + (TRAIL_ATR * safe_atr) if tp1_done else ep - (SL_ATR * safe_atr)
+                    tp1_price = ep + (TP1_ATR * safe_atr)
+                    tp2_price = ep + (TP2_ATR * safe_atr)
 
                     if self.current_price <= stop_price:
-                        ok, sold = self.executor.safe_market_sell(TICKER, 1.0)
+                        ok, sold, uuid = self.executor.safe_market_sell(TICKER, 1.0)
                         if ok:
-                            realized = (self.current_price - ep) * sold if sold > 0 else 0.0
+                            fill = self.executor.get_avg_fill_price(uuid, self.current_price)
+                            realized = calc_realized_pnl(fill, ep, sold) if sold > 0 else 0.0
                             if tp1_done:
-                                reason = "트레일 컷 (+1.2 ATR 익절 트레일)"
-                                header = f"🛡️ {b('[트레일 컷] +1.2 ATR')}"
+                                reason = f"트레일 컷 (+{TRAIL_ATR} ATR 익절 트레일)"
+                                header = f"🛡️ {b(f'[트레일 컷] +{TRAIL_ATR} ATR')}"
                             else:
-                                reason = "손절 (-1.5 ATR)"
-                                header = f"📉 {b('[손절 체결] -1.5 ATR')}"
+                                reason = f"손절 (-{SL_ATR} ATR)"
+                                header = f"📉 {b(f'[손절 체결] -{SL_ATR} ATR')}"
                                 self.cooldown_until = now + datetime.timedelta(hours=3)
-                            self.record_trade("SELL", self.current_price, sold, reason, pnl=realized)
-                            self._send_sell_notice(header, self.current_price, sold, reason, realized)
+                            self.record_trade("SELL", fill, sold, reason, pnl=realized)
+                            self._send_sell_notice(header, fill, sold, reason, realized)
                             if not tp1_done:
                                 self.noti.send_msg(
                                     f"⏳ {b('3시간 쿨다운 시작')}\n\n"
@@ -1174,28 +1217,30 @@ class QuantStrategy:
                             self._save_state()
 
                     elif self.current_price >= tp1_price and not tp1_done:
-                        ok, sold = self.executor.safe_market_sell(TICKER, 0.4)
+                        ok, sold, uuid = self.executor.safe_market_sell(TICKER, TP1_RATIO)
                         if ok:
-                            realized = (self.current_price - ep) * sold if sold > 0 else 0.0
-                            reason = "1차 익절 +2.0 ATR (40%)"
+                            fill = self.executor.get_avg_fill_price(uuid, self.current_price)
+                            realized = calc_realized_pnl(fill, ep, sold) if sold > 0 else 0.0
+                            reason = f"1차 익절 +{TP1_ATR} ATR ({TP1_RATIO*100:.0f}%)"
                             with self.pos.lock:
                                 self.pos.tp1_done = True
                             self._save_state()
-                            self.record_trade("SELL", self.current_price, sold, reason, pnl=realized)
+                            self.record_trade("SELL", fill, sold, reason, pnl=realized)
                             self._send_sell_notice(
-                                f"🔵 {b('[1차 익절 체결] +2.0 ATR (40%)')}",
-                                self.current_price, sold, reason, realized,
+                                f"🔵 {b(f'[1차 익절 체결] +{TP1_ATR} ATR ({TP1_RATIO*100:.0f}%)')}",
+                                fill, sold, reason, realized,
                             )
 
                     elif self.current_price >= tp2_price and tp1_done:
-                        ok, sold = self.executor.safe_market_sell(TICKER, 1.0)
+                        ok, sold, uuid = self.executor.safe_market_sell(TICKER, 1.0)
                         if ok:
-                            realized = (self.current_price - ep) * sold if sold > 0 else 0.0
-                            reason = "2차 최종 익절 +6.0 ATR (전량)"
-                            self.record_trade("SELL", self.current_price, sold, reason, pnl=realized)
+                            fill = self.executor.get_avg_fill_price(uuid, self.current_price)
+                            realized = calc_realized_pnl(fill, ep, sold) if sold > 0 else 0.0
+                            reason = f"2차 최종 익절 +{TP2_ATR} ATR (전량)"
+                            self.record_trade("SELL", fill, sold, reason, pnl=realized)
                             self._send_sell_notice(
-                                f"🔥 {b('[최종 익절 체결] +6.0 ATR (전량)')}",
-                                self.current_price, sold, reason, realized,
+                                f"🔥 {b(f'[최종 익절 체결] +{TP2_ATR} ATR (전량)')}",
+                                fill, sold, reason, realized,
                             )
                             self.pos.reset()
                             self._save_state()

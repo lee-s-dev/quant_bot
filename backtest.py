@@ -122,10 +122,12 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df_1h["high"], df_1h["low"], df_1h["close"], window=14
     ).adx()
 
-    # 15분봉 인덱스로 forward-fill (look-ahead 없음)
-    df["ema20"] = ema20_1h.reindex(df.index, method="ffill")
-    df["ema50"] = ema50_1h.reindex(df.index, method="ffill")
-    df["adx"]   = adx_1h.reindex(df.index, method="ffill")
+    # 15분봉 인덱스로 forward-fill.
+    # shift(1): 라벨 H의 1h 봉은 H시 *종가*까지 포함하므로 그대로 ffill하면
+    # 같은 시간대의 15분봉이 미래 종가를 보게 됨 → 직전 완결 봉 값만 사용
+    df["ema20"] = ema20_1h.shift(1).reindex(df.index, method="ffill")
+    df["ema50"] = ema50_1h.shift(1).reindex(df.index, method="ffill")
+    df["adx"]   = adx_1h.shift(1).reindex(df.index, method="ffill")
 
     # ── 15분봉 지표 ──────────────────────────────────────────
     df["atr"] = ta.volatility.AverageTrueRange(
@@ -155,7 +157,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════════
 # ⑤ 단일 백테스트 엔진 (NumPy 배열로 속도 최적화)
 # ══════════════════════════════════════════════════════════════
-def run_backtest(arrays: dict, params: dict) -> dict:
+def run_backtest(arrays: dict, params: dict, collect_pnls: bool = False) -> dict:
     """
     하나의 파라미터 조합으로 백테스트를 실행하고 성과지표를 반환.
 
@@ -361,7 +363,7 @@ def run_backtest(arrays: dict, params: dict) -> dict:
     gross_loss   = abs(sum(losses))
     pf           = gross_profit / gross_loss if gross_loss > 0 else 0.0
 
-    return {
+    out = {
         "total_return_pct": round(total_ret, 2),
         "sharpe":           round(sharpe, 3),
         "mdd_pct":          round(mdd, 2),
@@ -371,6 +373,9 @@ def run_backtest(arrays: dict, params: dict) -> dict:
         "final_equity":     round(final_eq, 0),
         "params":           params,
     }
+    if collect_pnls:
+        out["pnls"] = pnls
+    return out
 
 
 # ══════════════════════════════════════════════════════════════

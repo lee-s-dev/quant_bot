@@ -2,6 +2,8 @@
 .claude/
 bot_state.json
 backtest_results.json
+walkforward_results.json
+strategy.md
 *.pkl
 *.log
 venv/
