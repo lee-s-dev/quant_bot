@@ -205,7 +205,8 @@ class DataProvider:
             df_15m["vol_ma20"] = df_15m["volume"].rolling(window=20).mean()
             df_15m["highest"] = df_15m["high"].shift(1).rolling(window=HIGHEST_N).max()
 
-            return df_1h.iloc[-1], df_15m
+            # 1h는 진행 중인 봉(iloc[-1])이 아닌 직전 완결봉 사용 — 백테스트 정합
+            return df_1h.iloc[-2], df_15m
         except Exception as e:
             logger.error(f"데이터 수집 에러: {e}")
             return None, None
@@ -570,6 +571,7 @@ class QuantStrategy:
         self.flash_crash_until = now_kst()
         self.last_data_fetch = now_kst() - datetime.timedelta(minutes=1)
         self.last_closed_candle_time = None
+        self.last_setup_alert_candle = None
         self.last_error_time = now_kst() - datetime.timedelta(hours=1)
         self.last_mem_warn = now_kst() - datetime.timedelta(hours=1)
         self.last_mem_check = now_kst() - datetime.timedelta(seconds=60)
@@ -1073,7 +1075,23 @@ class QuantStrategy:
 
                     with self.pos.lock:
                         current_state = self.pos.state
-                        breakout_price = self.pos.breakout_price
+
+                    # ── 진입 필터 (모두 확정봉 기준 — 백테스트와 동일) ──────
+                    trend_ok = (
+                        (data_1h["adx"] > ADX_MIN)
+                        and (data_1h["ema20"] > data_1h["ema50"])
+                    )
+                    rsi_ok = (rsi_15m is not None) and (rsi_15m < RSI_MAX)
+                    vol_ok = (
+                        vol_ma20_15m is not None and vol_ma20_15m > 0
+                        and cur_volume_15m > vol_ma20_15m * VOL_MULT
+                    )
+                    atr_ok = (
+                        atr_15m is not None and closed_close_15m > 0
+                        and (atr_15m / closed_close_15m) >= ATR_MIN_PCT
+                    )
+                    candle_hour = current_closed_candle_time.hour
+                    time_ok = not (BLOCK_HOUR_START <= candle_hour <= BLOCK_HOUR_END)
 
                     if paused and current_state in ("IDLE", "SETUP"):
                         if current_state == "SETUP":
@@ -1082,63 +1100,47 @@ class QuantStrategy:
                             logger.info("SETUP 취소: 일시정지")
                             self.noti.send_msg(f"⏸️ {b('SETUP 취소')} (일시정지)")
 
-                    elif current_state == "IDLE" and not is_locked:
-                        is_uptrend = (
-                            (data_1h["adx"] > ADX_MIN)
-                            and (data_1h["ema20"] > data_1h["ema50"])
-                            and (self.current_price > data_1h["ema20"] * 1.005)
-                        )
-                        # ── 추가 진입 필터 (walk-forward 검증 결과 반영) ─────────
-                        # ① RSI 과매수 차단
-                        rsi_ok = (rsi_15m is not None) and (rsi_15m < RSI_MAX)
-                        # ② 거래량 확인 (현재봉 거래량 > VOL_MULT × 20봉 평균)
-                        vol_ok = (
-                            vol_ma20_15m is not None and vol_ma20_15m > 0
-                            and cur_volume_15m > vol_ma20_15m * VOL_MULT
-                        )
-                        # ③ 시간 필터 (유동성 저조 구간 차단)
-                        kst_hour = now.hour
-                        time_ok = not (BLOCK_HOUR_START <= kst_hour <= BLOCK_HOUR_END)
-
-                        if (is_uptrend
-                                and (self.current_price > highest_target)
-                                and rsi_ok and vol_ok and time_ok):
+                    elif not is_locked and current_state in ("IDLE", "SETUP"):
+                        # ── SETUP = 조기 경보 (진입 게이트 아님) ────────────
+                        # 틱 가격이 돌파선을 넘으면 알림만 보내고, 실제 진입
+                        # 판정은 아래에서 확정봉 종가 기준으로만 수행한다.
+                        if (current_state == "IDLE" and trend_ok
+                                and self.current_price > data_1h["ema20"] * 1.005
+                                and self.current_price > highest_target
+                                and current_closed_candle_time != self.last_setup_alert_candle):
                             self.pos.enter_setup(highest_target)
-                            self.last_closed_candle_time = current_closed_candle_time
+                            self.last_setup_alert_candle = current_closed_candle_time
                             self._save_state()
-                            self.last_entry_reason = (
-                                f"15분봉 Highest_{HIGHEST_N} 돌파 "
-                                f"(ADX {data_1h['adx']:.1f}, RSI {rsi_15m:.1f})"
-                            )
-                            logger.info(f"SETUP 진입 (기준가 {highest_target:,.0f})")
+                            current_state = "SETUP"
+                            logger.info(f"SETUP: 돌파 감지 (기준가 {highest_target:,.0f})")
                             self.noti.send_msg(
-                                f"🟡 {b('[SETUP 진입]')}\n\n"
+                                f"🟡 {b('[돌파 감지]')}\n\n"
                                 f"▫️ 돌파 기준가: <b>{fmt_krw(highest_target)}</b>\n"
                                 f"▫️ ADX(1h): <b>{data_1h['adx']:.1f}</b>\n"
-                                f"▫️ RSI(15m): <b>{rsi_15m:.1f}</b>\n"
-                                f"▫️ 거래량: <b>{cur_volume_15m/vol_ma20_15m:.2f}× MA20</b>\n"
-                                "▫️ 돌파 안착 확인 대기 중"
+                                "▫️ 15분봉 마감 후 종가 기준으로 진입 판정"
                             )
-
-                    elif current_state == "SETUP" and not is_locked:
-                        if data_1h["adx"] < ADX_MIN or data_1h["ema20"] < data_1h["ema50"]:
+                        elif current_state == "SETUP" and not trend_ok:
                             self.pos.reset()
                             self._save_state()
+                            current_state = "IDLE"
                             logger.info("SETUP 취소: 상위 추세 붕괴")
                             self.noti.send_msg(f"🚫 {b('SETUP 취소')} (상위 추세 붕괴)")
-                            continue
 
+                        # ── 진입 판정: 새 확정봉에서만, 그 봉의 값으로만 ────
                         if self.last_closed_candle_time != current_closed_candle_time:
                             self.last_closed_candle_time = current_closed_candle_time
-                            if closed_close_15m > breakout_price:
-                                if (atr_15m / self.current_price) < ATR_MIN_PCT:
-                                    self.pos.reset()
-                                    self._save_state()
-                                    logger.info("SETUP 취소: 변동성 부족")
-                                    self.noti.send_msg(f"🚫 {b('SETUP 취소')} (변동성 {ATR_MIN_PCT*100:.2f}% 미만)")
-                                    continue
-
-                                krw_bal = self.upbit.get_balance("KRW")
+                            entry_ok = (
+                                trend_ok
+                                and closed_close_15m > data_1h["ema20"] * 1.005
+                                and closed_close_15m > highest_target
+                                and rsi_ok and vol_ok and atr_ok and time_ok
+                            )
+                            if entry_ok:
+                                self.last_entry_reason = (
+                                    f"15분봉 Highest_{HIGHEST_N} 종가 돌파 "
+                                    f"(ADX {data_1h['adx']:.1f}, RSI {rsi_15m:.1f})"
+                                )
+                                krw_bal = self.upbit.get_balance("KRW") or 0.0
                                 budget = RiskManager.get_position_size(
                                     krw_bal, self.current_price, atr_15m
                                 )
@@ -1152,7 +1154,7 @@ class QuantStrategy:
                                             self.pos.enter_position(avg_buy, atr_15m)
                                             self._save_state()
                                             logger.info(f"POSITION 진입 (평단 {avg_buy:,.0f})")
-                                            reason = self.last_entry_reason or "15분봉 돌파 안착"
+                                            reason = self.last_entry_reason
                                             self.record_trade(
                                                 "BUY", avg_buy, actual_btc_bal, reason, pnl=None
                                             )
@@ -1164,23 +1166,26 @@ class QuantStrategy:
                                             self._save_state()
                                             logger.warning("잔고 검증 실패로 포지션 롤백")
                                             self.noti.send_msg(
-                                                f"⚠️ {b('매수 후 잔고 검증 실패')}. SETUP 해제"
+                                                f"⚠️ {b('매수 후 잔고 검증 실패')}. 진입 취소"
                                             )
                                     else:
                                         self.pos.reset()
                                         self._save_state()
                                         logger.warning("매수 주문 실패")
                                         self.noti.send_msg(
-                                            f"⚠️ {b('매수 주문 실패')}. SETUP 해제"
+                                            f"⚠️ {b('매수 주문 실패')}. 진입 취소"
                                         )
                                 else:
                                     self.pos.reset()
                                     self._save_state()
-                                    logger.info("SETUP 취소: 예산 5000원 미만")
-                            else:
+                                    logger.info("진입 취소: 예산 5000원 미만")
+                            elif current_state == "SETUP":
                                 self.pos.reset()
                                 self._save_state()
-                                logger.info("SETUP 취소: 돌파 안착 실패")
+                                logger.info("SETUP 해제: 확정봉 진입 조건 미충족")
+                                self.noti.send_msg(
+                                    f"🚫 {b('SETUP 해제')} (확정봉 진입 조건 미충족)"
+                                )
 
                 with self.pos.lock:
                     in_position = self.pos.state == "POSITION" and self.pos.entry_price > 0

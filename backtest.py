@@ -161,10 +161,11 @@ def run_backtest(arrays: dict, params: dict, collect_pnls: bool = False) -> dict
     """
     하나의 파라미터 조합으로 백테스트를 실행하고 성과지표를 반환.
 
-    상태 머신:
-        0 = IDLE   → 진입 조건 스캔
-        1 = SETUP  → 브레이크아웃 감지, 다음 봉 종가 확인 대기
+    상태 머신 (라이브 봇과 정합):
+        0 = IDLE     → 확정봉 종가 기준 진입 조건 스캔, 충족 시 그 봉 종가에 체결
         2 = POSITION → TP1 / TP2 / 손절 모니터링
+    ※ 진입은 "확정봉이 직전 highest_n 위에서 마감 + 같은 봉의 RSI/거래량/ATR 필터
+      통과"의 단일봉 판정. 라이브 봇도 15분봉 마감 직후 동일 조건으로 시장가 매수.
     """
     p = params
 
@@ -199,7 +200,6 @@ def run_backtest(arrays: dict, params: dict, collect_pnls: bool = False) -> dict
     state     = 0
     entry_px  = 0.0
     atr_entry = 0.0
-    bp        = 0.0       # breakout_price
     tp1_done  = False
     cooldown  = -1        # cooldown 종료 인덱스
 
@@ -216,20 +216,20 @@ def run_backtest(arrays: dict, params: dict, collect_pnls: bool = False) -> dict
         if i <= cooldown:
             continue
 
-        # ── IDLE: 진입 조건 스캔 ─────────────────────────────
+        # ── IDLE: 확정봉 진입 판정 → 충족 시 그 봉 종가에 체결 ──
         if state == 0:
-            # 1h 상위 추세 필터
+            # 1h 상위 추세 필터 (직전 완결 1h 봉 기준)
             if not (adx[i] >= adx_thr
                     and ema20[i] > ema50[i]
                     and px > ema20[i] * 1.005):
                 continue
-            # 브레이크아웃 감지 (직전 봉까지의 최고가 돌파)
+            # 종가 돌파 확정 (확정봉 종가 > 직전 highest_n 최고가)
             if px <= highest[i]:
                 continue
-            # RSI 과매수 필터
+            # RSI 과매수 필터 (돌파봉 자신의 값)
             if rsi_max < 9999 and rsi[i] > rsi_max:
                 continue
-            # 거래량 필터
+            # 거래량 필터 (돌파봉 자신의 값)
             if vol_mult < 9999 and vol[i] < vol_ma[i] * vol_mult:
                 continue
             # ATR 변동성 필터
@@ -239,39 +239,18 @@ def run_backtest(arrays: dict, params: dict, collect_pnls: bool = False) -> dict
             if p["time_filter"] and 1 <= kst_hour[i] <= 4:
                 continue
 
-            # → SETUP 진입
-            state = 1
-            bp    = highest[i]
-
-        # ── SETUP: 다음 봉 종가 안착 확인 ────────────────────
-        elif state == 1:
-            # 상위 추세 붕괴 시 취소
-            if adx[i] < adx_thr or ema20[i] < ema50[i]:
-                state = 0
-                continue
-            # 변동성 소멸 시 취소
-            if atr[i] / px < atr_min:
-                state = 0
-                continue
-            # 이전 봉 종가가 브레이크아웃 가격 위에 안착했는지 확인
-            if close[i - 1] <= bp:
-                state = 0   # 안착 실패
-                continue
-
             # ── 포지션 사이즈 계산 (1% 리스크 룰) ───────────
             sl_pct  = sl_mult * atr[i] / px
             if sl_pct <= 0:
-                state = 0
                 continue
             budget  = min(
                 capital * 0.01 / sl_pct,   # 1% 리스크
                 capital * 0.50             # 최대 50%
             )
             if budget < 5_000 or capital < 5_000:
-                state = 0
                 continue
 
-            # ── 매수 체결 ────────────────────────────────────
+            # ── 매수 체결 (돌파봉 마감 직후 시장가 ≈ 그 봉 종가) ──
             exec_px   = px * (1 + COST)
             qty       = budget / exec_px
             capital  -= budget

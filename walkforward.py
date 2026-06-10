@@ -181,21 +181,24 @@ def main():
             "total_trades": ntr,
         }
 
-    # ── 몬테카를로: plateau OOS 거래 부트스트랩 ───────────────
-    pnls = [p for r in agg["plateau"] for p in r.get("pnls", [])]
-    mc = None
-    if len(pnls) >= 15:
-        rng = np.random.default_rng(42)
+    # ── 몬테카를로: 방식별 OOS 거래 부트스트랩 (방식 라벨 명시) ──
+    mc = {}
+    rng = np.random.default_rng(42)
+    for name in methods:
+        pnls = [p for r in agg[name] for p in r.get("pnls", [])]
+        if len(pnls) < 15:
+            continue
         sims = np.array([rng.choice(pnls, size=len(pnls), replace=True).sum()
                          for _ in range(3000)]) / INITIAL_CAPITAL * 100
-        mc = {"n_trades": len(pnls),
-              "p5":  round(float(np.percentile(sims, 5)), 2),
-              "p50": round(float(np.percentile(sims, 50)), 2),
-              "p95": round(float(np.percentile(sims, 95)), 2),
-              "prob_loss_pct": round(float((sims < 0).mean() * 100), 1)}
-        print(f"\n  🎲 몬테카를로 (plateau OOS {len(pnls)}건 부트스트랩 3,000회)")
-        print(f"     총수익률 분포: p5 {mc['p5']:+.2f}% / p50 {mc['p50']:+.2f}% / "
-              f"p95 {mc['p95']:+.2f}%   손실 확률 {mc['prob_loss_pct']:.0f}%")
+        mc[name] = {"n_trades": len(pnls),
+                    "p5":  round(float(np.percentile(sims, 5)), 2),
+                    "p50": round(float(np.percentile(sims, 50)), 2),
+                    "p95": round(float(np.percentile(sims, 95)), 2),
+                    "prob_loss_pct": round(float((sims < 0).mean() * 100), 1)}
+        m = mc[name]
+        print(f"\n  🎲 몬테카를로 [{name}] (OOS {len(pnls)}건 부트스트랩 3,000회)")
+        print(f"     총수익률 분포: p5 {m['p5']:+.2f}% / p50 {m['p50']:+.2f}% / "
+              f"p95 {m['p95']:+.2f}%   손실 확률 {m['prob_loss_pct']:.0f}%")
 
     with open(RESULT_FILE, "w", encoding="utf-8") as f:
         json.dump({"run_at": datetime.now().isoformat(),
